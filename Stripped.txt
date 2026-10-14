@@ -1,0 +1,4197 @@
+if getgenv().KiciaRebuild and getgenv().KiciaRebuild.Unload then
+    pcall(getgenv().KiciaRebuild.Unload)
+end
+if not game:IsLoaded() then game.Loaded:Wait() end
+print("[Kicia] script file executing, PlaceId=" .. tostring(game.PlaceId))
+
+local K: { [string]: any } = { connections = {}, cleanups = {}, destroyed = false }
+getgenv().KiciaRebuild = K
+
+local Players = game:GetService("Players")
+local _ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local _CollectionService = game:GetService("CollectionService")
+local _HttpService = game:GetService("HttpService")
+local _SoundService = game:GetService("SoundService")
+local _Lighting = game:GetService("Lighting")
+local _player = Players.LocalPlayer
+
+local rawget, rawset = rawget, rawset
+
+function K.fn(name)
+    local v
+    pcall(function() v = getgenv()[name] end)
+    if type(v) ~= "function" then pcall(function() v = getgenv()[name] end) end
+    return type(v) == "function" and v or nil
+end
+
+local getthreadidentity_ = K.fn("getthreadidentity") or K.fn("getidentity")
+local setthreadidentity_ = K.fn("setthreadidentity") or K.fn("setidentity")
+local _sethiddenproperty = K.fn("sethiddenproperty")
+local gethui_ = K.fn("gethui")
+local function identity(n)
+    if not setthreadidentity_ then return function() end end
+    local old = getthreadidentity_ and getthreadidentity_() or nil
+    pcall(setthreadidentity_, n)
+    return function() if old then pcall(setthreadidentity_, old) end end
+end
+K.identity = identity
+local function hudParent()
+    local ok, h = pcall(function() return gethui_ and gethui_() end)
+    if ok and h then return h end
+    return game:GetService("CoreGui")
+end
+K.hudParent = hudParent
+
+function K.track(c) K.connections[#K.connections + 1] = c; return c end
+function K.onUnload(f) K.cleanups[#K.cleanups + 1] = f end
+
+--==========================================================================
+--  Signal / Trove (Kicia's own small versions)
+--==========================================================================
+local Signal = {}
+Signal.__index = Signal
+function Signal.new() return setmetatable({ _handlers = {} }, Signal) end
+function Signal:Connect(fn)
+    local h = { fn = fn, connected = true }
+    table.insert(self._handlers, h)
+    local sig = self
+    return {
+        Connected = true,
+        Disconnect = function(c)
+            if not h.connected then return end
+            h.connected = false
+            c.Connected = false
+            local i = table.find(sig._handlers, h)
+            if i then table.remove(sig._handlers, i) end
+        end,
+    }
+end
+function Signal:Once(fn)
+    local c
+    c = self:Connect(function(...) c:Disconnect(); fn(...) end)
+    return c
+end
+function Signal:Fire(...)
+    local list = table.clone(self._handlers)
+    for _, h in ipairs(list) do
+        if h.connected then task.spawn(h.fn, ...) end
+    end
+end
+function Signal:FireSync(...)
+    for _, h in ipairs(table.clone(self._handlers)) do
+        if h.connected then h.fn(...) end
+    end
+end
+function Signal:Destroy() table.clear(self._handlers) end
+K.Signal = Signal
+
+local Trove = {}
+Trove.__index = Trove
+function Trove.new(name) return setmetatable({ _name = name, _items = {} }, Trove) end
+local function cleanItem(o)
+    local t = typeof(o)
+    if t == "RBXScriptConnection" then o:Disconnect()
+    elseif t == "Instance" then pcall(function() o:Destroy() end)
+    elseif t == "thread" then pcall(task.cancel, o)
+    elseif type(o) == "function" then pcall(o)
+    elseif type(o) == "table" then
+        --  some objects (Kicia's signal connections) error on unknown fields
+        local function member(k)
+            local ok, v = pcall(function() return o[k] end)
+            return ok and type(v) == "function" and v or nil
+        end
+        local cancel, getStatus = member("cancel"), member("getStatus")
+        if cancel and getStatus then pcall(cancel, o); return end
+        local destroy = member("Destroy")
+        if destroy then pcall(destroy, o); return end
+        local disconnect = member("Disconnect")
+        if disconnect then pcall(disconnect, o) end
+    end
+end
+function Trove:Add(o) table.insert(self._items, o); return o end
+function Trove:Connect(sig, fn) return self:Add(sig:Connect(fn)) end
+function Trove:Extend() return self:Add(Trove.new(self._name)) end
+function Trove:Remove(o, keep)
+    local i = table.find(self._items, o)
+    if i then
+        table.remove(self._items, i)
+        if not keep then cleanItem(o) end
+    end
+end
+--  Promise held until it settles; cancelled if the trove is cleaned first.
+function Trove:AddPromise(promise)
+    if tostring(promise:getStatus()) == "Started" then
+        self:Add(promise)
+        promise:finally(function()
+            if not self._cleaning then self:Remove(promise, true) end
+        end)
+    end
+    return promise
+end
+--  Sub-trove that cleans itself up when `instance` is destroyed.
+function Trove:AttachExtend(instance)
+    local sub = self:Extend()
+    sub:Connect(instance.Destroying, function() self:Remove(sub) end)
+    return sub
+end
+function Trove:Clean()
+    local items = self._items
+    self._items = {}
+    self._cleaning = true
+    for i = #items, 1, -1 do cleanItem(items[i]) end
+    self._cleaning = false
+end
+Trove.Destroy = Trove.Clean
+K.Trove = Trove
+
+--==========================================================================
+--  Kicia's constant pool (v86[...]) as recovered from usage in the dump
+--==========================================================================
+local C = {
+    [3] = "Toggle", [9] = 20, [12] = 12, [18] = "0", [26] = 4, [34] = true, [44] = "Enabled",
+    [45] = 90, [48] = 2, [53] = 20, [55] = "Mode", [56] = 2, [62] = 0.1, [63] = 1, [68] = "table",
+    [75] = "None", [83] = 64, [91] = 100, [95] = "number", [101] = 0.5, [108] = 255, [116] = "boolean",
+    [118] = 16, [122] = 8, [126] = 0.15, [127] = "CFrame", [128] = "Frame", [133] = 10, [137] = 256,
+    [147] = 0.1, [149] = 1, [153] = false, [155] = 3, [160] = 50, [162] = 8, [165] = "string",
+    [170] = 9, [173] = 0.88, [175] = 5, [186] = 0, [192] = 30, [195] = 0.7,
+}
+K.C = C
+
+--==========================================================================
+--  Kicia's own UI, settings store and Combat menu (lifted from the dump)
+--==========================================================================
+local v86 = {
+    [2] = "ReactiveStore",
+    [3] = "Toggle",
+    [4] = "UIListLayout",
+    [5] = "BackgroundColor3",
+    [6] = 0,
+    [7] = 60,
+    [8] = 60,
+    [9] = 20,
+    [12] = 12,
+    [13] = 14,
+    [14] = "Settings",
+    [15] = 120,
+    [16] = "min",
+    [17] = 200,
+    [18] = "0",
+    [19] = 200,
+    [20] = "Vector3",
+    [21] = "Always",
+    [22] = "",
+    [23] = 1.4707963267948965,
+    [24] = "Roboto",
+    [25] = 24,
+    [26] = 4,
+    [27] = "Color",
+    [28] = 0.2,
+    [29] = "Size",
+    [30] = 0.35,
+    [31] = 29,
+    [32] = 24,
+    [33] = "Button",
+    [34] = true,
+    [35] = "ConfigManager",
+    [36] = "ApplyMigrations",
+    [37] = "TextBounds",
+    [38] = "DeleteFile",
+    [39] = "Slider",
+    [40] = "...",
+    [42] = "left",
+    [43] = "Proggy Clean",
+    [44] = "Enabled",
+    [45] = 90,
+    [46] = "UIGradient",
+    [47] = "CanvasGroup",
+    [48] = 0.3,
+    [49] = 2,
+    [50] = "Side",
+    [51] = " ",
+    [52] = "BottomRight",
+    [53] = 92,
+    [54] = 6,
+    [55] = "Mode",
+    [56] = 2,
+    [57] = "TextColor",
+    [58] = 80,
+    [59] = "Font",
+    [60] = 29,
+    [61] = 20,
+    [62] = 0.1,
+    [63] = 1,
+    [64] = "ScrollingFrame",
+    [65] = 200,
+    [66] = 0.5,
+    [67] = 100,
+    [68] = "table",
+    [69] = "Catalog unavailable",
+    [70] = "GradientDark",
+    [71] = 10,
+    [72] = 12,
+    [73] = "Keybind",
+    [74] = 0.9,
+    [75] = "None",
+    [76] = "LoadFromFile",
+    [77] = "FireServer",
+    [78] = 720,
+    [79] = 255,
+    [80] = "Text",
+    [81] = 1,
+    [82] = "Realize() can only be called on the root",
+    [83] = 64,
+    [84] = 0.5,
+    [85] = "UIStroke",
+    [87] = 0.8,
+    [88] = "TabHighlight",
+    [89] = "Loading",
+    [90] = "Gradient",
+    [91] = 100,
+    [92] = "TextButton",
+    [93] = "ColorSequence",
+    [94] = "Options",
+    [95] = "number",
+    [96] = "Unselected",
+    [97] = "Mode",
+    [98] = "UICorner",
+    [99] = "ExportToJson",
+    [100] = 14,
+    [101] = 0.5,
+    [102] = 231,
+    [103] = 52,
+    [104] = "Fonts",
+    [105] = 0.85,
+    [106] = "Menu Keybind",
+    [107] = 40,
+    [108] = 255,
+    [109] = 77,
+    [110] = 70,
+    [111] = "Fetching items...",
+    [112] = "Invisible",
+    [113] = "UIPadding",
+    [114] = "primary",
+    [115] = "Color3",
+    [116] = "boolean",
+    [118] = 16,
+    [119] = 159,
+    [120] = "Outline",
+    [121] = "ImageButton",
+    [122] = 8,
+    [123] = 19,
+    [124] = "X",
+    [125] = "Proggy Tiny",
+    [126] = 0.15,
+    [127] = "CFrame",
+    [128] = "Frame",
+    [129] = "Show Watermark",
+    [131] = "AbsoluteSize",
+    [132] = "Breathing",
+    [133] = 10,
+    [134] = "GradientTop",
+    [135] = "TextLabel",
+    [136] = "Unselected Text",
+    [137] = 256,
+    [138] = 0.85,
+    [139] = "Accent",
+    [140] = "danger",
+    [141] = "GradientDeep",
+    [142] = "Silent Load",
+    [143] = 32,
+    [144] = 20,
+    [145] = "Dialog has been destroyed",
+    [146] = "ImageLabel",
+    [147] = 0.1,
+    [148] = "TextBox",
+    [149] = 1,
+    [150] = "stop",
+    [151] = "family",
+    [153] = false,
+    [154] = "ScrollBarImageColor3",
+    [155] = 3,
+    [156] = "ImageColor3",
+    [157] = 20,
+    [158] = "secondary",
+    [159] = 20,
+    [160] = 50,
+    [161] = 0.5,
+    [162] = 8,
+    [163] = 80,
+    [164] = "hue",
+    [165] = "string",
+    [166] = "family",
+    [167] = "TextColor3",
+    [168] = "ElementBackground",
+    [169] = "FromJson",
+    [170] = 9,
+    [172] = "none",
+    [173] = 0.88,
+    [174] = "Unselected",
+    [175] = 5,
+    [176] = "UISizeConstraint",
+    [177] = "Try a different search.",
+    [178] = "ElementBackground",
+    [181] = 10,
+    [182] = "HttpService",
+    [183] = 72,
+    [184] = "Color",
+    [186] = 0,
+    [187] = "GradientMid",
+    [189] = "Position",
+    [190] = "Search...",
+    [191] = "TabShadow",
+    [192] = 30,
+    [193] = 0,
+    [194] = "Hold",
+    [195] = 0.7,
+    [196] = "Viewport",
+    [197] = "Y",
+    [198] = 400,
+    [199] = "Unload",
+    [200] = 26,
+}
+--  Environment Kicia's modules expect: the module table and the aliases its
+--  loader set up before them (v102 = rawget, v103 = rawset, v107 = pcall).
+local tbl17: { [string]: any } = { cache = {} }
+local v102, v103, v107 = rawget, rawset, pcall
+--  The obfuscator's integrity counters. Every check in the lifted code has one
+--  branch that hangs and one that runs the real code; these values sit inside
+--  the window where all of them take the real branch (n26 in [4790, 4809),
+--  n25 in [3866, 3887]).
+local n25, n26 = 3870, 4800
+local flag2, flag3 = true, true
+local function n29(...) return 0 end
+local cloneref = K.fn("cloneref") or function(x) return x end
+local gethui = K.fn("gethui") or function() return game:GetService("CoreGui") end
+local getthreadidentity = K.fn("getthreadidentity") or K.fn("getidentity") or function() return 8 end
+local setthreadidentity = K.fn("setthreadidentity") or K.fn("setidentity") or function() end
+--  The rest of the loader's locals (clonefunction'd so hooks on them can't see us).
+local function clonefn(f)
+    local c = K.fn("clonefunction")
+    if c and f then
+        local ok, r = pcall(c, f)
+        if ok and r then return r end
+    end
+    return f
+end
+local fireServer = clonefn(Instance.new("RemoteEvent").FireServer)
+local fireServer2 = clonefn(Instance.new("UnreliableRemoteEvent").FireServer)
+local v104 = clonefn(K.fn("sethiddenproperty"))
+local v108 = clonefn(K.fn("setfflag")) or function() end
+local v109 = clonefn(K.fn("isexecutorclosure")) or function() return false end
+local v110 = clonefn(K.fn("setrawmetatable")) or setmetatable
+local v111 = clonefn(K.fn("getrawmetatable")) or getmetatable
+local v112 = clonefn(v111(game).__newindex)
+local v113 = clonefn(v111(game).__index)
+local v114 = clonefn(game.FindFirstChildOfClass)
+local function _n27() return 0 end
+local firetouchinterest = K.fn("firetouchinterest") or function() end
+local getconnections = K.fn("getconnections") or function() return {} end
+local setclipboard = K.fn("setclipboard") or K.fn("toclipboard") or function() end
+local InstanceHandle
+pcall(function() InstanceHandle = getgenv().InstanceHandle end)
+if InstanceHandle == nil then pcall(function() InstanceHandle = getgenv().InstanceHandle end) end
+if InstanceHandle == nil then InstanceHandle = { new = function(x) return x end } end
+--  The modules the decompiler lost (their bodies are `fn35(...) end` in
+--  the dump), rebuilt from how the rest of Kicia's code calls them.
+
+--  k: Trove
+tbl17.k = function() return { new = function(name) return Trove.new(name) end } end
+
+do -- a
+local function fn35()
+return {
+ok = function(arg)
+return { Ok = true, Value = arg }
+end,
+err = function(arg, arg2, arg3)
+return { Ok = false, Error = { Source = arg, Stage = arg2, Detail = arg3, Timestamp = os.clock() } }
+end,
+formatError = function(arg)
+local v115 = tostring
+local detail = arg.Detail
+return string.format("'%s' @ %s failed during stage '%s'; %s", tostring(arg.Source), tostring(arg.Timestamp), tostring(arg.Stage), v115(detail))
+end,
+VoidOk = table.freeze({ Ok = true, Value = nil }),
+}
+end
+
+tbl17.a = function()
+local a = tbl17.cache.a
+
+if not a then
+a = { c = fn35() }
+tbl17.cache.a = a
+end
+
+return a.c
+end
+end
+do -- b
+local function fn35()
+tbl17.a()
+local v115 = nil
+
+return {
+use = function(arg)
+v115 = arg
+end,
+get = function()
+assert(v115)
+return v115
+end,
+}
+end
+
+tbl17.b = function()
+local b = tbl17.cache.b
+
+if not b then
+b = { c = fn35() }
+tbl17.cache.b = b
+end
+
+return b.c
+end
+end
+do -- g
+local function fn35()local I;local function W(N,...)local P=I;I=nil;N(...);I=P;end;local function N(...)W(...);while true do W(coroutine.yield());end;end;local W_1={};W_1.__index=W_1;W_1.Disconnect=function(P)if not P.Connected then return;end;P.Connected=false;if P._signal._handlerListHead==P then P._signal._handlerListHead=P._next;else local a=P._signal._handlerListHead;while a and a._next~=P do a=a._next;end;if a then a._next=P._next;end;end;end;W_1.Destroy=W_1.Disconnect;setmetatable(W_1,{__index=function(P,P_2)error(("Attempt to get Connection::%s (not a valid member)"):format(tostring(P_2)),2);end,__newindex=function(P,P_3,a)error(("Attempt to set Connection::%s (not a valid member)"):format(tostring(P_3)),2);end});local P={};P.__index=P;P.new=function()return(setmetatable({_handlerListHead=false,_proxyHandler=nil,_yieldedThreads=nil},P));end;P.Wrap=function(a)assert(typeof(a)=="RBXScriptSignal","Argument #1 to Signal.Wrap must be a RBXScriptSignal; got "..typeof(a));local e=P.new();e._proxyHandler=a:Connect(function(...)e:Fire(...);end);return e;end;P.Is=function(a)return type(a)=="table"and getmetatable(a)==P;end;P.Connect=function(a,e)local c=setmetatable({Connected=true,_signal=a,_fn=e,_next=false},W_1);if a._handlerListHead then c._next=a._handlerListHead;a._handlerListHead=c;else a._handlerListHead=c;end;return c;end;P.ConnectOnce=function(W,a)return W:Once(a);end;P.Once=function(W,a)local e;local c=false;e=W:Connect(function(...)if c then return;end;c=true;e:Disconnect();a(...);end);return e;end;P.GetConnections=function(W)local a,e={},W._handlerListHead;while e do table.insert(a,e);e=e._next;end;return a;end;P.DisconnectAll=function(W)local a=W._handlerListHead;while a do a.Connected=false;a=a._next;end;W._handlerListHead=false;a= v102 (W,"_yieldedThreads");if a then for e in a,nil,nil do if coroutine.status(e)=="suspended"then warn((debug.traceback :: any)(e,"signal disconnected; yielded thread cancelled",2));task.cancel(e);end;end;table.clear(W._yieldedThreads);end;end;P.Fire=function(W,...)local a=W._handlerListHead;while a do if a.Connected then W=I;if not W then I=coroutine.create(N);end;task.spawn(I,a._fn,...);end;a=a._next;end;end;P.FireDeferred=function(I,...)local W=I._handlerListHead;while W do local I_4=W;task.defer(function(...)if I_4.Connected then I_4._fn(...);end;end,...);W=W._next;end;end;P.Wait=function(I)local W= v102 (I,"_yieldedThreads");if not W then W={}; v103 (I,"_yieldedThreads",W);end;local N=coroutine.running();W[N]=true;I:Once(function(...)W[N]=nil;if coroutine.status(N)=="suspended"then task.spawn(N,...);end;end);return coroutine.yield();end;P.Destroy=function(I)I:DisconnectAll();local W= v102 (I,"_proxyHandler");if W then W:Disconnect();end;end;return table.freeze({new=P.new,Wrap=P.Wrap,Is=P.Is});end
+
+tbl17.g = function()
+local g = tbl17.cache.g
+
+if not g then
+local g2 = { c = fn35() }
+tbl17.cache.g = g2
+g = g2
+end
+
+return g.c
+end
+end
+do -- ad
+local function fn35()
+local v115 = tbl17.b()
+tbl17.a()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function()
+local tbl18 = { _errors = {}, _sink = v115.get() }
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Report = function(arg, arg2)
+local errors = arg._errors
+
+if #errors >= v86[137] then
+table.remove(errors, v86[63])
+end
+
+table.insert(errors, arg2)
+local sink = arg._sink
+
+if sink ~= nil then
+sink:Report(arg2)
+end
+end
+
+index2.ReportResult = function(arg, arg2)
+if not arg2.Ok then
+arg:Report(arg2.Error)
+end
+
+return arg2
+end
+
+index2.GetErrors = function(arg)
+return arg._errors
+end
+
+index2.Destroy = function(arg)
+table.clear(arg._errors)
+arg._sink = nil
+end
+
+return index2
+end
+
+tbl17.ad = function()
+local ad = tbl17.cache.ad
+
+if not ad then
+local ad2 = { c = fn35() }
+tbl17.cache.ad = ad2
+ad = ad2
+end
+
+return ad.c
+end
+end
+do -- ay
+local function fn35()local I={__mode="k"};local function W(N)if type(N)=="function"then return true;end;if type(N)=="table"then local P=getmetatable(N);if P and type( v102 (P,"__call"))=="function"then return true;end;end;return false;end;local function N(P,a)local e={};for c,c_34 in ipairs(a)do e[c_34]=c_34;end;return setmetatable(e,{__index=function(a,a_35)error(string.format("%s is not in %s!",a_35,P),2);end,__newindex=function()error(string.format("Creating new members in %s is not allowed!",P),2);end});end;local P:any;P={Kind=N("Promise.Error.Kind",{"ExecutionError","AlreadyCancelled","NotResolvedInTime","TimedOut"})};P.__index=P;P.new=function(a,e)a=a or{};return setmetatable({error=tostring(a.error)or"[This error has no error text.]",trace=a.trace,context=a.context,kind=a.kind,parent=e,createdTick=os.clock(),createdTrace=debug.traceback()},P);end;P.is=function(a)if type(a)=="table"then local e=getmetatable(a);if type(e)=="table"then return  v102 (a,"error")~=nil and type( v102 (e,"extend"))=="function";end;end;return false;end;P.isKind=function(a,e)assert(e~=nil,"Argument #2 to Promise.Error.isKind must not be nil");return P.is(a)and a.kind==e;end;P.extend=function(a,e)e=e or{};e.kind=e.kind or a.kind;return P.new(e,a);end;P.getErrorChain=function(a)local e={a};while e[#e].parent do table.insert(e,e[#e].parent);end;return e;end;P.__tostring=function(a)local e={string.format("-- Promise.Error(%s) --",a.kind or"?")};for c,c_36 in ipairs(a:getErrorChain())do table.insert(e,table.concat({c_36.trace or c_36.error,c_36.context},"\10"));end;return table.concat(e,"\10");end;local function a(...)return select("#",...),{...};end;local function e(c,...)return c,select("#",...),{...};end;local function c(E)assert(E~=nil,"traceback is nil");return function(p)if type(p)=="table"then return p;end;return P.new({error=p,kind=P.Kind.ExecutionError,trace=debug.traceback(tostring(p),2),context="Promise created at:\10\10"..E});end;end;local function E(p,T,...)return e(xpcall(T,c(p),...));end;local function e_37(c,p,T,t)return function(...)local x,S,J=E(c,p,...);if x then T(unpack(J,1,S));else t(J[1]);end;end;end;local function c_38(p)return next(p)==nil;end;local p:any={Error=P,Status=N("Promise.Status",{"Started","Resolved","Rejected","Cancelled"}),_getTime=os.clock,_timeEvent=game:GetService("RunService").Heartbeat,_unhandledRejectionCallbacks={},prototype={}};p.__index=p.prototype;p._new=function(N,T,t)if t~=nil and not p.is(t)then error("Argument #2 to Promise.new must be a promise or nil",2);end;local x={_thread=nil,_source=N,_status=p.Status.Started,_values=nil,_valuesLength=-1,_unhandledRejection=true,_queuedResolve={},_queuedReject={},_queuedFinally={},_cancellationHook=nil,_parent=t,_consumers=setmetatable({},I)};if t and t._status==p.Status.Started then t._consumers[x]=true;end;setmetatable(x,p);local function I(...)x:_resolve(...);end;local function N_39(...)x:_reject(...);end;local function t_40(S)if S then if x._status==p.Status.Cancelled then S();else x._cancellationHook=S;end;end;return x._status==p.Status.Cancelled;end;x._thread=coroutine.create(function()local S,_J,J_41=E(x._source,T,I,N_39,t_40);if not S then N_39(J_41[1]);end;end);task.spawn(x._thread);return x;end;p.new=function(I)return p._new(debug.traceback(nil,2),I);end;p.__tostring=function(I)return string.format("Promise(%s)",I._status);end;p.defer=function(I)local N=debug.traceback(nil,2);return(p._new(N,function(T,t,x)local S;S=p._timeEvent:Connect(function()S:Disconnect();local S,_J_42,J_43=E(N,I,T,t,x);if not S then t(J_43[1]);end;end);end));end;p.async=p.defer;p.resolve=function(...)local I,N=a(...);return p._new(debug.traceback(nil,2),function(E)E(unpack(N,1,I));end);end;p.reject=function(...)local I,N=a(...);return p._new(debug.traceback(nil,2),function(E,E_44)E_44(unpack(N,1,I));end);end;p._try=function(I,N,...)local E,T=a(...);return p._new(I,function(I)I(N(unpack(T,1,E)));end);end;p.try=function(I,...)return p._try(debug.traceback(nil,2),I,...);end;p._all=function(I,N,E)if type(N)~="table"then error(string.format("Please pass a list of promises to %s","Promise.all"),3);end;for T,t in pairs(N)do if not p.is(t)then error(string.format("Non-promise value passed into %s at index %s","Promise.all",tostring(T)),3);end;end;if#N==0 or E==0 then return p.resolve({});end;return p._new(I,function(I,T,t)local x,S,J,B,X={},{},0,0,false;local function H()for k,k_45 in ipairs(S)do k_45:cancel();end;end;local function k(D,...)if X then return;end;J+=1;if E==nil then x[D]=...;else x[J]=...;end;if J>=(E or#N)then X=true;I(x);H();end;end;t(H);for I,t in ipairs(N)do S[I]=t:andThen(function(...)k(I,...);end,function(...)B+=1;if E==nil or#N-B<E then H();X=true;T(...);end;end);end;if X then H();end;end);end;p.all=function(I)return p._all(debug.traceback(nil,2),I);end;p.fold=function(I,N,E)assert(type(I)=="table","Bad argument #1 to Promise.fold: must be a table");assert(W(N),"Bad argument #2 to Promise.fold: must be a function");local T=p.resolve(E);return p.each(I,function(I,E)T=T:andThen(function(t)return N(t,I,E);end);end):andThen(function()return T;end);end;p.some=function(I,N)assert(type(N)=="number","Bad argument #2 to Promise.some: must be a number");return p._all(debug.traceback(nil,2),I,N);end;p.any=function(I)return p._all(debug.traceback(nil,2),I,1):andThen(function(I)return I[1];end);end;p.allSettled=function(I)if type(I)~="table"then error(string.format("Please pass a list of promises to %s","Promise.allSettled"),2);end;for N,E in pairs(I)do if not p.is(E)then error(string.format("Non-promise value passed into %s at index %s","Promise.allSettled",tostring(N)),2);end;end;if#I==0 then return p.resolve({});end;return p._new(debug.traceback(nil,2),function(N,E,E_46)local T,t,x={},{},0;local function S(J,...)x+=1;T[J]=...;if x>=#I then N(T);end;end;E_46(function()for N,N_47 in ipairs(t)do N_47:cancel();end;end);for N,E in ipairs(I)do t[N]=E:finally(function(...)S(N,...);end);end;end);end;p.race=function(I)assert(type(I)=="table",string.format("Please pass a list of promises to %s","Promise.race"));for N,E in pairs(I)do assert(p.is(E),string.format("Non-promise value passed into %s at index %s","Promise.race",tostring(N)));end;return p._new(debug.traceback(nil,2),function(N,E,T)local t,x={},false;local function S()for J,J_48 in ipairs(t)do J_48:cancel();end;end;local function J(B)return function(...)S();x=true;return B(...);end;end;if T((J(E)))then return;end;for T,B in ipairs(I)do t[T]=B:andThen(J(N),(J(E)));end;if x then S();end;end);end;p.each=function(I,N)assert(type(I)=="table",string.format("Please pass a list of promises to %s","Promise.each"));assert(W(N),string.format("Please pass a handler function to %s!","Promise.each"));return p._new(debug.traceback(nil,2),function(E,T,t)local x,S,J={},{},false;local function B()for X,X_49 in ipairs(S)do X_49:cancel();end;end;t(function()J=true;B();end);t={};for X,H in ipairs(I)do if p.is(H)then if H:getStatus()==p.Status.Cancelled then B();return T(P.new({error="Promise is cancelled",kind=P.Kind.AlreadyCancelled,context=string.format("The Promise that was part of the array at index %d passed into Promise.each was already cancelled when Promise.each began.\10\10That Promise was created at:\10\10%s",X,H._source)}));elseif H:getStatus()==p.Status.Rejected then B();return T(select(2,H:await()));end;local I=H:andThen(function(...)return...;end);table.insert(S,I);t[X]=I;else t[X]=H;end;end;for I,X in ipairs(t)do if p.is(X)then local t_50;t_50,X=X:await();if not t_50 then B();return T(X);end;end;if J then return;end;local t_51=p.resolve(N(X,I));table.insert(S,t_51);local N,S_52=t_51:await();if not N then B();return T(S_52);end;x[I]=S_52;end;E(x);return nil end);end;p.is=function(I)if type(I)~="table"then return false;end;local N=getmetatable(I);if N==p then return true;elseif N==nil then return W(I.andThen);elseif type(N)=="table"and type( v102 (N,"__index"))=="table"and(W( v102 ( v102 (N,"__index"),"andThen")))then return true;end;return false;end;p.promisify=function(l)return function(...)return p._try(debug.traceback(nil,2),l,...);end;end;do local l,I_53;p.delay=function(N)assert(type(N)=="number","Bad argument #1 to Promise.delay, must be a number.");if not(N>=0.016666666666666666)or N==math.huge then N=0.016666666666666666;end;return p._new(debug.traceback(nil,2),function(E,T,t)T=p._getTime();local x=T+N;local N={resolve=E,startTime=T,endTime=x};if I_53==nil then l=N;I_53=p._timeEvent:Connect(function()local S=p._getTime();while l~=nil and l.endTime<S do local S_54=l;local J=S_54;l=S_54.next;if l==nil then I_53:Disconnect();I_53=nil;else l.previous=nil;end;J.resolve(p._getTime()-J.startTime);end;end);elseif l.endTime<x then T=l;E=T.next;while E~=nil and E.endTime<x do E,T=E.next,E;end;T.next=N;N.previous=T;if E~=nil then N.next=E;E.previous=N;end;else N.next=l;l.previous=N;l=N;end;t(function()local E=N.next;if l==N then if E==nil then I_53:Disconnect();I_53=nil;else E.previous=nil;end;l=E;else local l=N.previous;l.next=E;if E~=nil then E.previous=l;end;end;end);end);end;end;p.prototype.timeout=function(l,I,N)local E=debug.traceback(nil,2);return p.race({p.delay(I):andThen(function()return p.reject(N==nil and(P.new({kind=P.Kind.TimedOut,error="Timed out",context=string.format("Timeout of %d seconds exceeded.\10:timeout() called at:\10\10%s",I,E)}))or N);end),l});end;p.prototype.getStatus=function(l)return l._status;end;p.prototype._andThen=function(l,I,N,E)l._unhandledRejection=false;if l._status==p.Status.Cancelled then local T=p.new(function()end);T:cancel();return T;end;return p._new(I,function(T,t,x)local S=T;if N then S=e_37(I,N,T,t);end;local N=t;if E then N=e_37(I,E,T,t);end;if l._status==p.Status.Started then table.insert(l._queuedResolve,S);table.insert(l._queuedReject,N);x(function()if l._status==p.Status.Started then table.remove(l._queuedResolve,table.find(l._queuedResolve,S));table.remove(l._queuedReject,table.find(l._queuedReject,N));end;end);elseif l._status==p.Status.Resolved then S(unpack(l._values,1,l._valuesLength));elseif l._status==p.Status.Rejected then N(unpack(l._values,1,l._valuesLength));end;end,l);end;p.prototype.andThen=function(l,I,N)assert(I==nil or(W(I)),string.format("Please pass a handler function to %s!","Promise:andThen"));assert(N==nil or(W(N)),string.format("Please pass a handler function to %s!","Promise:andThen"));return l:_andThen(debug.traceback(nil,2),I,N);end;p.prototype.catch=function(l,I)assert(I==nil or(W(I)),string.format("Please pass a handler function to %s!","Promise:catch"));return l:_andThen(debug.traceback(nil,2),nil,I);end;p.prototype.tap=function(l,I)assert(W(I),string.format("Please pass a handler function to %s!","Promise:tap"));return l:_andThen(debug.traceback(nil,2),function(...)local l=I(...);if p.is(l)then local I,N=a(...);return l:andThen(function()return unpack(N,1,I);end);end;return...;end);end;p.prototype.andThenCall=function(l,I,...)assert(W(I),string.format("Please pass a handler function to %s!","Promise:andThenCall"));local N,e=a(...);return l:_andThen(debug.traceback(nil,2),function()return I(unpack(e,1,N));end);end;p.prototype.andThenReturn=function(l,...)local I,N=a(...);return l:_andThen(debug.traceback(nil,2),function()return unpack(N,1,I);end);end;p.prototype.cancel=function(l)if l._status~=p.Status.Started then return;end;l._status=p.Status.Cancelled;if l._cancellationHook then l._cancellationHook();end;coroutine.close(l._thread);if l._parent then l._parent:_consumerCancelled(l);end;for I in pairs(l._consumers)do I:cancel();end;l:_finalize();end;p.prototype._consumerCancelled=function(l,I)if l._status~=p.Status.Started then return;end;l._consumers[I]=nil;if next(l._consumers)==nil then l:cancel();end;end;p.prototype._finally=function(l,I,N)l._unhandledRejection=false;return(p._new(I,function(I,e,E)local T;E(function()l:_consumerCancelled(l);if T then T:cancel();end;end);E=if N then function(...)local t=N(...);if p.is(t)then T=t;t:finally(function(N)if N~=p.Status.Rejected then I(l);end;end):catch(function(...)e(...);end);else I(l);end;end else I;if l._status==p.Status.Started then table.insert(l._queuedFinally,E);else E(l._status);end;end));end;p.prototype.finally=function(l,I)assert(I==nil or(W(I)),string.format("Please pass a handler function to %s!","Promise:finally"));return l:_finally(debug.traceback(nil,2),I);end;p.prototype.finallyCall=function(l,I,...)assert(W(I),string.format("Please pass a handler function to %s!","Promise:finallyCall"));local N,e=a(...);return l:_finally(debug.traceback(nil,2),function()return I(unpack(e,1,N));end);end;p.prototype.finallyReturn=function(l,...)local I,N=a(...);return l:_finally(debug.traceback(nil,2),function()return unpack(N,1,I);end);end;p.prototype.awaitStatus=function(l)l._unhandledRejection=false;if l._status==p.Status.Started then local I=coroutine.running();l:finally(function()task.spawn(I);end):catch(function()end);coroutine.yield();end;if l._status==p.Status.Resolved then return l._status,unpack(l._values,1,l._valuesLength);elseif l._status==p.Status.Rejected then return l._status,unpack(l._values,1,l._valuesLength);end;return l._status;end;local function l(I,...)return I==p.Status.Resolved,...;end;p.prototype.await=function(I)return l(I:awaitStatus());end;local function l_55(I,...)if I~=p.Status.Resolved then error(...==nil and"Expected Promise rejected with no value."or(...),3);end;return...;end;p.prototype.expect=function(I)return l_55(I:awaitStatus());end;p.prototype.awaitValue=p.prototype.expect;p.prototype._unwrap=function(l)if l._status==p.Status.Started then error("Promise has not resolved or rejected.",2);end;return l._status==p.Status.Resolved,unpack(l._values,1,l._valuesLength);end;p.prototype._resolve=function(l,...)if l._status~=p.Status.Started then if p.is(...)then(...):_consumerCancelled(l);end;return;end;if p.is(...)then if select("#",...)>1 then warn((string.format("When returning a Promise from andThen, extra arguments are discarded! See:\10\10%s",l._source)));end;local I=...;local N=I:andThen(function(...)l:_resolve(...);end,function(...)local e=I._values[1];e=if I._error then(P.new({error=I._error,kind=P.Kind.ExecutionError,context="No stack trace available as this Promise originated from an older version of the Promise library (< v2)"}))else e;if P.isKind(e,P.Kind.ExecutionError)then return l:_reject(e:extend({error="This Promise was chained to a Promise that errored.",trace="",context=string.format("The Promise at:\10\10%s\10...Rejected because it was chained to the following Promise, which encountered an error:\10",l._source)}));end;l:_reject(...);return nil end);if N._status==p.Status.Cancelled then l:cancel();elseif N._status==p.Status.Started then l._parent=N;N._consumers[l]=true;end;return;end;l._status=p.Status.Resolved;l._valuesLength,l._values=a(...);for I,I_56 in ipairs(l._queuedResolve)do coroutine.wrap(I_56)(...);end;l:_finalize();end;p.prototype._reject=function(l,...)if l._status~=p.Status.Started then return;end;l._status=p.Status.Rejected;l._valuesLength,l._values=a(...);if not c_38(l._queuedReject)then for I,I_57 in ipairs(l._queuedReject)do coroutine.wrap(I_57)(...);end;else local I=tostring(...);coroutine.wrap(function()p._timeEvent:Wait();if not l._unhandledRejection then return;end;local N=string.format("Unhandled Promise rejection:\10\10%s\10\10%s",I,l._source);for I,I_58 in ipairs(p._unhandledRejectionCallbacks)do task.spawn(I_58,l,unpack(l._values,1,l._valuesLength));end;if p.TEST then return;end;warn(N);end)();end;l:_finalize();end;p.prototype._finalize=function(l)for I,I_59 in ipairs(l._queuedFinally)do coroutine.wrap(I_59)(l._status);end;l._queuedFinally=nil;l._queuedReject=nil;l._queuedResolve=nil;if not p.TEST then l._parent=nil;l._consumers=nil;end;task.defer(coroutine.close,l._thread);end;p.prototype.now=function(l,I)local N=debug.traceback(nil,2);if l._status==p.Status.Resolved then return l:_andThen(N,function(...)return...;end);else return p.reject(I==nil and(P.new({kind=P.Kind.NotResolvedInTime,error="This Promise was not resolved in time for :now()",context=":now() was called at:\10\10"..N}))or I);end;end;p.retry=function(l,I,...)assert(W(l),"Parameter #1 to Promise.retry must be a function");assert(type(I)=="number","Parameter #2 to Promise.retry must be a number");local N,P={...},select("#",...);return p.resolve(l(...)):catch(function(...)if I>0 then return p.retry(l,I-1,unpack(N,1,P));else return p.reject(...);end;end);end;p.retryWithDelay=function(l,I,N,...)assert(W(l),"Parameter #1 to Promise.retry must be a function");assert(type(I)=="number","Parameter #2 (times) to Promise.retry must be a number");assert(type(N)=="number","Parameter #3 (seconds) to Promise.retry must be a number");local W,P={...},select("#",...);return p.resolve(l(...)):catch(function(...)if I>0 then p.delay(N):await();return p.retryWithDelay(l,I-1,N,unpack(W,1,P));else return p.reject(...);end;end);end;p.fromEvent=function(l,I)I=I or function()return true;end;return p._new(debug.traceback(nil,2),function(W,N,N_60)local P;local a=false;local function e()P:Disconnect();P=nil;end;P=l:Connect(function(...)local l=I(...);if l==true then W(...);if P then e();else a=true;end;elseif type(l)~="boolean"then error("Promise.fromEvent predicate should always return a boolean");end;end);if a and P then e();return;end;N_60(e);end);end;p.onUnhandledRejection=function(l)table.insert(p._unhandledRejectionCallbacks,l);return function()local I=table.find(p._unhandledRejectionCallbacks,l);if I then table.remove(p._unhandledRejectionCallbacks,I);end;end;end;return p;end
+
+tbl17.ay = function()
+local ay = tbl17.cache.ay
+
+if not ay then
+local ay2 = { c = fn35() }
+tbl17.cache.ay = ay2
+ay = ay2
+end
+
+return ay.c
+end
+end
+do -- aR
+local function fn35()
+return function(arg, arg2, arg3, arg4)
+local tbl18
+
+if typeof(arg2) ~= "string" then
+tbl18 = arg2
+else
+tbl18 = { arg2 }
+end
+
+for _, v115 in tbl18, nil, nil do
+local v116
+
+if arg4 ~= nil then
+v116 = arg:WaitForChild(v115, arg4)
+if v116 == nil then
+return nil
+end
+else
+local _t0 = os.clock()
+while true do
+v116 = arg:WaitForChild(v115, 5)
+if v116 ~= nil then
+break
+end
+print("[Kicia] waiting for " .. arg:GetFullName() .. " -> " .. tostring(v115) .. " (" .. math.floor(os.clock() - _t0) .. "s)")
+if os.clock() - _t0 > 60 then
+error("[Kicia] timed out waiting for " .. arg:GetFullName() .. " -> " .. tostring(v115) .. ". Wrong game? This script is built for Rivals.", 2)
+end
+end
+end
+
+arg = cloneref(v116)
+end
+
+if arg3 then
+local _ok, _res = pcall(require, arg)
+if _ok then
+return _res
+end
+for _try = 1, 4 do
+task.wait(2)
+_ok, _res = pcall(require, arg)
+if _ok then
+return _res
+end
+end
+return require(arg)
+end
+return cloneref(arg)
+end
+end
+
+tbl17.aR = function()
+local ar = tbl17.cache.aR
+
+if not ar then
+ar = { c = fn35() }
+tbl17.cache.aR = ar
+end
+
+return ar.c
+end
+end
+do -- aS
+local function fn35()
+tbl17.aP()
+tbl17.aL()
+tbl17.aN()
+tbl17.aM()
+tbl17.aQ()
+tbl17.aO()
+local v115 = tbl17.aR()
+local v116 = cloneref(game:GetService("Players"))
+local v117 = cloneref(game:GetService("ReplicatedStorage"))
+local localPlayer = v116.LocalPlayer
+local playerScripts = v115(localPlayer, "PlayerScripts")
+local controllers = v115(playerScripts, "Controllers")
+local modules = v115(v117, "Modules")
+local modules2 = v115(playerScripts, "Modules")
+local clientReplicatedClasses = v115(modules2, "ClientReplicatedClasses")
+local remotes = v115(v117, "Remotes")
+local replication = v115(remotes, "Replication")
+local v118 = v115(replication, { "Fighter", "UseItem" })
+local v119 = v115(replication, { "Fighter", "RegisterQuickAttack" })
+local v120 = v115(replication, { "Fighter", "UpdateState" })
+local v121 = v115(replication, { "Fighter", "PickWeapons" })
+local v122 = v115(replication, { "Fighter", "UpdateCameraRotation" })
+local v123 = v115(remotes, { "Duels", "RespawnNow" })
+local v124 = v115(remotes, { "Duels", "Vote" })
+local v125 = v115(remotes, { "Misc", "RequestProfile" })
+local shootingRangeTrashItems = v115(v115(remotes, "Misc"), "ShootingRangeTrashItems")
+local replicatedController = v115(modules2, "ReplicatedController", true)
+local controlsController = v115(controllers, "ControlsController", true)
+local fighterController = v115(controllers, "FighterController", true)
+local mechanicsController = v115(controllers, "MechanicsController", true)
+local enemyController = v115(controllers, "EnemyController", true)
+local shootingRangeController = v115(controllers, "ShootingRangeController", true)
+local arcadeController = v115(controllers, "ArcadeController", v86[34])
+local cameraController = v115(controllers, "CameraController", true)
+local duelController = v115(controllers, "DuelController", true)
+local complianceController = v115(controllers, "ComplianceController", true)
+local userInterface = v115(modules2, "UserInterface")
+local equipment = v115(userInterface, "Equipment", v86[34])
+local lobby = v115(userInterface, "Lobby")
+local module = require(lobby)
+local pages = v115(userInterface, "Pages", true)
+local matchmaking = v115(lobby, "Matchmaking", true)
+local constants = v115(modules, "CONSTANTS", true)
+local enumLibrary = v115(modules, "EnumLibrary", true)
+local inputLibrary = v115(modules, "InputLibrary", true)
+local seasonLibrary = v115(modules, "SeasonLibrary", true)
+local cosmeticLibrary = v115(modules, "CosmeticLibrary", true)
+local itemLibrary = v115(modules, "ItemLibrary", true)
+local duelLibrary = v115(modules, "DuelLibrary", true)
+local utility = v115(modules, "Utility", true)
+local playerDataUtility = v115(modules, "PlayerDataUtility", true)
+local taskLibrary = v115(modules, "TaskLibrary", true)
+local replicatedClass = v115(modules, "ReplicatedClass", true)
+local outOfBoundsMachine = v115(modules, "OutOfBoundsMachine", true)
+local playerDataController = v115(controllers, "PlayerDataController", true)
+local matchmakingController = v115(controllers, "MatchmakingController", true)
+local leaderboardController = v115(controllers, "LeaderboardController", v86[34])
+local clientEntity = v115(clientReplicatedClasses, "ClientEntity", true)
+local clientDueler = v115(clientReplicatedClasses, "ClientDueler", true)
+local v126 = v115(clientReplicatedClasses, { "ClientFighter", "ClientFighterCharacter" }, true)
+local v127 = v115(clientReplicatedClasses, { "ClientFighter", "ClientFighterCharacter", "Joints" }, true)
+local v128 = v115(clientReplicatedClasses, { "ClientFighter", "ClientFighterCharacter", "Visibility" }, true)
+local v129 = v115(clientReplicatedClasses, { "ClientFighter", "ClientItem" }, v86[34])
+local v130 = v115(clientReplicatedClasses, { "ClientFighter", "ClientItem", "ClientViewModel" }, true)
+local v131 = v115(clientReplicatedClasses, { "ClientFighter", "ClientItem", "ClientViewModel", "ViewModelAnimator" }, true)
+local v132 = v115(clientReplicatedClasses, { "ClientFighter", "ClientItem", "ItemInterface", "Other" }, v86[34])
+local v133 = v115(clientReplicatedClasses, { "ClientFighter", "ClientItem", "ItemInterface", "Mouse", "Scope" }, true)
+local cosmeticSlot = v115(modules2, "CosmeticSlot", true)
+local crosshair = v115(modules2, "Crosshair", true)
+local cosmeticViewportFrame = v115(modules2, "CosmeticViewportFrame", true)
+local v134 = v115(modules2, { "ItemTypes", "Gun" }, true)
+local v135 = v115(modules2, { "ItemTypes", "Throwable" }, v86[34])
+local pages2 = v115(modules2, "Pages")
+local equipEmote = v115(pages2, "EquipEmote", true)
+local pickEmote = v115(pages2, "PickEmote", true)
+local viewProfile = v115(pages2, "ViewProfile", true)
+local v136 = v115(v117, { "Modules", "Emotes" })
+local v137 = v115(v117, { "Modules", "Finishers" })
+local v138 = v115(v117, { "Modules", "ServerOsTime" }, v86[34])
+
+return {
+Modules = modules,
+Controllers = controllers,
+UserInterface = userInterface,
+Equipment = equipment,
+Lobby = module,
+MatchmakingInterface = matchmaking,
+MatchmakingController = matchmakingController,
+LeaderboardController = leaderboardController,
+UseItemRemote = v118,
+QuickAttackFunction = v119,
+UpdateStateRemote = v120,
+PickWeaponsRemote = v121,
+UpdateCameraRotationRemote = v122,
+ShootingRangeTrashItemsEvent = shootingRangeTrashItems,
+RespawnNowRemote = v123,
+VoteEvent = v124,
+PagesModule = pages,
+RequestProfileFunction = v125,
+Constants = constants,
+TaskLibrary = taskLibrary,
+ReplicatedController = replicatedController,
+ControlsController = controlsController,
+PlayerDataController = playerDataController,
+FighterController = fighterController,
+MechanicsController = mechanicsController,
+EnemyController = enemyController,
+ShootingRangeController = shootingRangeController,
+ArcadeController = arcadeController,
+CameraController = cameraController,
+DuelController = duelController,
+ComplianceController = complianceController,
+EnumLibrary = enumLibrary,
+InputLibrary = inputLibrary,
+SeasonLibrary = seasonLibrary,
+CosmeticLibrary = cosmeticLibrary,
+ItemLibrary = itemLibrary,
+DuelLibrary = duelLibrary,
+Utility = utility,
+PlayerDataUtility = playerDataUtility,
+ReplicatedClass = replicatedClass,
+OutOfBoundsMachine = outOfBoundsMachine,
+ClientEntity = clientEntity,
+ClientDueler = clientDueler,
+ClientFighterCharacter = v126,
+ClientFighterCharacterJoints = v127,
+ClientFighterCharacterVisibility = v128,
+Gun = v134,
+Throwable = v135,
+ClientItem = v129,
+ClientViewModel = v130,
+ViewModelAnimator = v131,
+ItemInterfaceOther = v132,
+Scope = v133,
+Crosshair = crosshair,
+CosmeticSlot = cosmeticSlot,
+CosmeticViewportFrame = cosmeticViewportFrame,
+Pages = pages2,
+EquipEmote = equipEmote,
+PickEmote = pickEmote,
+ViewProfile = viewProfile,
+Emotes = v136,
+Finishers = v137,
+PlayerModule = v115(localPlayer, { "PlayerScripts", "PlayerModule" }, v86[34]),
+ServerOsTime = v138,
+}
+end
+
+tbl17.aS = function()
+local as = tbl17.cache.aS
+
+if not as then
+as = { c = fn35() }
+tbl17.cache.aS = as
+end
+
+return as.c
+end
+end
+do -- b2
+local function fn35()
+return function(arg, arg2)
+return compareinstances ~= nil and compareinstances(arg, arg2) or arg == arg2
+end
+end
+
+tbl17.b2 = function()
+local b2 = tbl17.cache.b2
+
+if not b2 then
+b2 = { c = fn35() }
+tbl17.cache.b2 = b2
+end
+
+return b2.c
+end
+end
+do -- b3
+local function fn35()
+return function(arg, ...)
+local v115 = getthreadidentity()
+setthreadidentity(v86[56])
+local pack = table.pack
+local v116 = v107
+local v117 = table.pack(...)
+v117.n = 2 + v117.n - 1
+table.move(v117, 1, v117.n, 2, v117)
+v117[1] = arg
+local v118 = pack(v116(table.unpack(v117, 1, v117.n)))
+setthreadidentity(v115)
+
+if not v118[1] then
+error(v118[v86[56]], 2)
+end
+
+return unpack(v118, 2, v118.n)
+end
+end
+
+tbl17.b3 = function()
+local b3 = tbl17.cache.b3
+
+if not b3 then
+b3 = { c = fn35() }
+tbl17.cache.b3 = b3
+end
+
+return b3.c
+end
+end
+do -- cp
+local function fn35()
+local cameraController = tbl17.aS().CameraController
+local setRotation = v102(v102(getmetatable(cameraController), "__index"), "SetRotation")
+return { get = function() return v102(cameraController, "Rotation") or Vector2.zero end, set = function(I)coroutine.wrap( setRotation )( cameraController ,I);end }
+end
+
+tbl17.cp = function()
+local cp = tbl17.cache.cp
+
+if not cp then
+local cp2 = { c = fn35() }
+tbl17.cache.cp = cp2
+cp = cp2
+end
+
+return cp.c
+end
+end
+do -- cr
+local function fn35()
+local v115 = tbl17.g()
+local v116 = tbl17.k()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local CharacterContext = v116.new("fighters.CharacterContext")
+
+local tbl18 = {
+_trove = CharacterContext,
+_player = arg,
+State = { Alive = false },
+Created = CharacterContext:Add(v115.new()),
+Died = CharacterContext:Add(v115.new()),
+}
+
+setmetatable(tbl18, index2)
+tbl18:_Initialize()
+return tbl18
+end
+
+index2._Initialize = function(arg)
+local v117 = arg._trove:Extend()
+
+local function fn36()
+local state = arg.State
+
+if state.Alive then
+v117:Clean()
+arg.State = { Alive = false }
+arg.Died:Fire(state)
+end
+end
+
+local function fn37(arg2)
+local humanoid = arg2:WaitForChild("Humanoid", math.huge)
+if humanoid.Health <= 0 then
+return
+end
+local humanoidRootPart = arg2:WaitForChild("HumanoidRootPart", math.huge)
+local hitboxHead = arg2:WaitForChild("HitboxHead", math.huge)
+local hitboxBody = arg2:WaitForChild("HitboxBody", math.huge)
+local hitboxHeadSmall = arg2:WaitForChild("HitboxHeadSmall", math.huge)
+local hitboxBodySmall = arg2:WaitForChild("HitboxBodySmall", math.huge)
+
+v117:Connect(humanoid:GetPropertyChangedSignal("Health"), function()
+local health = humanoid.Health
+
+if arg.State.Alive then
+if health > 0 then
+arg.State.Health = health
+else
+fn36()
+end
+end
+end)
+
+v117:Connect(humanoid:GetPropertyChangedSignal("MaxHealth"), function()
+local maxHealth = humanoid.MaxHealth
+
+if arg.State.Alive then
+if maxHealth > 0 then
+arg.State.MaxHealth = maxHealth
+else
+fn36()
+end
+end
+end)
+
+local state = {
+Alive = v86[34],
+Health = humanoid.Health,
+MaxHealth = humanoid.MaxHealth,
+Model = arg2,
+Humanoid = humanoid,
+RootPart = humanoidRootPart,
+HitboxHead = hitboxHead,
+HitboxBody = hitboxBody,
+TargetPartsByName = { HitboxHead = hitboxHead, HitboxBody = hitboxBody, HitboxHeadSmall = hitboxHeadSmall, HitboxBodySmall = hitboxBodySmall },
+_lastPosition = nil,
+Velocity = Vector3.zero,
+}
+
+arg.State = state
+arg.Created:Fire(state)
+end
+
+arg._trove:Connect(arg._player.CharacterAdded, fn37)
+arg._trove:Connect(arg._player.CharacterRemoving, fn36)
+local character = arg._player.Character
+
+if character ~= nil then
+task.spawn(fn37, character)
+end
+end
+
+index2.Update = function(l,I)l:_UpdateVelocity(I);end
+index2._UpdateVelocity = function(l,I)local W=l.State;if not W.Alive then return;end;local l_74,N=W.RootPart.Position,W._lastPosition;if N==nil then W._lastPosition=l_74;return;end;W.Velocity=(l_74-N)/I;W._lastPosition=l_74;end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cr = function()
+local cr = tbl17.cache.cr
+
+if not cr then
+cr = { c = fn35() }
+tbl17.cache.cr = cr
+end
+
+return cr.c
+end
+end
+do -- cs
+local function fn35()
+local v115 = cloneref(game:GetService("RunService"))
+local v116 = cloneref(game:GetService(v86[182]))
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local tbl18 = { _rootPart = arg, _boundId = v116:GenerateGUID(v86[153]) }
+setmetatable(tbl18, index2)
+tbl18:_Initialize()
+return tbl18
+end
+
+index2._Initialize = function(arg)
+v115:BindToRenderStep(arg._boundId, Enum.RenderPriority.First.Value, function()
+arg:_RenderStepUpdate()
+end)
+end
+
+index2.SetServerCFrame = function(arg, cframe)
+arg._cframe = cframe
+local oldCFrame = arg._oldCFrame
+
+if oldCFrame ~= nil then
+arg._rootPart.CFrame = cframe or oldCFrame
+end
+end
+
+index2.GetServerCFrame = function(arg)
+return arg._cframe or arg._rootPart.CFrame
+end
+
+index2.GetClientCFrame = function(arg)
+return arg._oldCFrame or arg._rootPart.CFrame
+end
+
+index2._RenderStepUpdate = function(arg)
+local oldCFrame = arg._oldCFrame
+
+if oldCFrame ~= nil then
+arg._rootPart.CFrame = oldCFrame
+arg._oldCFrame = nil
+end
+end
+
+index2.HeartbeatUpdate = function(arg)
+local cframe = arg._cframe
+if cframe == nil then
+return
+end
+local rootPart = arg._rootPart
+
+if arg._oldCFrame == nil then
+arg._oldCFrame = rootPart.CFrame
+end
+
+rootPart.CFrame = cframe
+end
+
+index2.Destroy = function(arg)
+arg:_RenderStepUpdate()
+v115:UnbindFromRenderStep(arg._boundId)
+end
+
+return index2
+end
+
+tbl17.cs = function()
+local cs = tbl17.cache.cs
+
+if not cs then
+cs = { c = fn35() }
+tbl17.cache.cs = cs
+end
+
+return cs.c
+end
+end
+do -- ct
+local function fn35()
+return tbl17.g().new().Connect
+end
+
+tbl17.ct = function()
+local ct = tbl17.cache.ct
+
+if not ct then
+local ct2 = { c = fn35() }
+tbl17.cache.ct = ct2
+ct = ct2
+end
+
+return ct.c
+end
+end
+do -- cu
+local function fn35()
+tbl17.g()
+local v115 = tbl17.ct()
+
+return function(arg, arg2)
+return v115(arg, function(...)
+local v116 = getthreadidentity()
+setthreadidentity(8)
+arg2(...)
+setthreadidentity(v116)
+end)
+end
+end
+
+tbl17.cu = function()
+local cu = tbl17.cache.cu
+
+if not cu then
+cu = { c = fn35() }
+tbl17.cache.cu = cu
+end
+
+return cu.c
+end
+end
+do -- cv
+local function fn35()
+tbl17.aM()
+
+return function(arg, arg2)
+return v102(v102(arg, "Data"), arg2)
+end
+end
+
+tbl17.cv = function()
+local cv = tbl17.cache.cv
+
+if not cv then
+cv = { c = fn35() }
+tbl17.cache.cv = cv
+end
+
+return cv.c
+end
+end
+do -- cw
+local function fn35()
+local v115 = tbl17.cr()
+tbl17.aM()
+tbl17.aO()
+local v116 = tbl17.g()
+local v117 = tbl17.k()
+local v118 = tbl17.cu()
+local v119 = tbl17.ct()
+local v120 = tbl17.cv()
+local v121 = tbl17.b3()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg, arg2)
+local LocalFighterState = v117.new("fighters.LocalFighterState")
+local v122 = v102(getmetatable(arg2), "__index")
+local v123 = v102(arg2, "Data")
+
+local obj = setmetatable({
+_trove = LocalFighterState,
+_data = v123,
+_inputFn = v102(v122, "Input"),
+_quickAttackFn = v102(v122, "QuickAttack"),
+Inner = arg2,
+Player = arg,
+Character = LocalFighterState:Add(v115.new(arg)),
+ObjectId = v102(v123, "ObjectID"),
+EnvironmentId = arg:GetAttribute("EnvironmentID"),
+IsSpectating = v120(arg2, "IsSpectating") == true,
+EnvironmentIdChanged = LocalFighterState:Add(v116.new()),
+IsSpectatingChanged = LocalFighterState:Add(v116.new()),
+EntityAdded = LocalFighterState:Add(v116.new()),
+EntityRemoved = LocalFighterState:Add(v116.new()),
+}, index2)
+
+obj._trove:Connect(arg:GetAttributeChangedSignal("EnvironmentID"), function()
+local attribute = arg:GetAttribute("EnvironmentID")
+obj.EnvironmentId = attribute
+obj.EnvironmentIdChanged:Fire(attribute)
+end)
+
+obj._trove:Add(v119(v121(arg2.GetDataChangedSignal, arg2, "IsSpectating"), function()
+local isSpectating = v120(arg2, "IsSpectating") == true
+if isSpectating == obj.IsSpectating then
+return
+end
+obj.IsSpectating = isSpectating
+obj.IsSpectatingChanged:Fire(isSpectating)
+end))
+
+local inner = obj.Inner
+
+obj._trove:Add(v119(v102(inner, "EntityAdded"), function(arg3)
+obj.EntityAdded:Fire(arg3)
+end))
+
+obj._trove:Add(v119(v102(inner, "EntityRemoved"), function(arg3)
+obj.EntityRemoved:Fire(arg3)
+end))
+
+local entity = v102(inner, "Entity")
+
+if entity ~= nil then
+obj.EntityAdded:Fire(entity)
+end
+
+return obj
+end
+
+index2.GetEntity = function(arg)
+return v102(arg.Inner, "Entity")
+end
+
+index2.GetItems = function(arg)
+return v102(arg.Inner, "Items")
+end
+
+index2.GetEquippedItem = function(arg)
+return v102(arg.Inner, "EquippedItem")
+end
+
+index2.IsInvincible = function(arg)
+local entity = v102(arg.Inner, "Entity")
+local data = entity and v102(entity, "Data")
+return data ~= nil and v102(data, "IsInvincible") == true
+end
+index2.IsCrouching = function(arg)
+local data = v102(arg.Inner, "Data")
+return data ~= nil and v102(data, "IsCrouching") == true
+end
+
+index2.FindItemByObjectId = function(arg, arg2)
+local v122 = next
+local items, v123 = arg:GetItems()
+
+for _, v124 in v122, items, v123 do
+if arg2 == v102(v102(v124, "Data"), "ObjectID") then
+return v124
+end
+end
+
+return nil
+end
+
+index2.OnItemAddedSignal = function(arg, arg2)
+return v118(v102(arg.Inner, "ItemAdded"), arg2)
+end
+
+index2.OnItemRemovedSignal = function(arg, arg2)
+return v118(v102(arg.Inner, "ItemRemoved"), arg2)
+end
+
+index2.OnEquippedItemChangedSignal = function(arg, arg2)
+return v118(v102(arg.Inner, "EquippedItemChanged"), function()
+arg2(arg:GetEquippedItem())
+end)
+end
+
+index2.Input = function(arg, arg2)
+v121(arg._inputFn, arg.Inner, arg2)
+end
+
+index2.QuickAttack = function(arg, arg2)
+if not arg.Character.State.Alive then
+return
+end
+task.spawn(v121, arg._quickAttackFn, arg.Inner, arg2)
+end
+
+index2.Update = function(l,I)l.Character:Update(I);end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cw = function()
+local cw = tbl17.cache.cw
+
+if not cw then
+local cw2 = { c = fn35() }
+tbl17.cache.cw = cw2
+cw = cw2
+end
+
+return cw.c
+end
+end
+do -- cx
+local function fn35()
+local seasonLibrary = tbl17.aS().SeasonLibrary
+
+return function(arg, arg2)
+if arg2 == nil then
+return "Unranked"
+end
+local name = v102(v102(v102(seasonLibrary, "CurrentSeason"), "RankProfile"), "Name")
+local v115 = v102(v102(seasonLibrary, "RankProfiles"), name)
+if v115 == nil then
+return "Unranked"
+end
+local ranksOrder = v102(v115, "RanksOrder")
+local ranks = v102(v115, "Ranks")
+local v116 = rawlen(ranksOrder)
+
+for k, v117 in next, ranksOrder, nil do
+local v118 = v102(ranks, v117)
+if v118 == nil then
+continue
+end
+
+if arg2 < v102(v118, "RequiredELO") and v102(v118, "RequiredELOLeaderboardRanking") == nil then
+local v119 = v102(ranksOrder, math.clamp(k - 1, 1, v116))
+if v119 ~= nil then
+return v119
+end
+end
+end
+
+for i = v116, 1, -1 do
+local v117 = v102(ranksOrder, i)
+
+if v117 ~= nil then
+local v118 = v102(ranks, v117)
+if v118 ~= nil and v102(v118, "RequiredELOLeaderboardRanking") == nil then
+return v117
+end
+end
+end
+
+return "Unranked"
+end
+end
+
+tbl17.cx = function()
+local cx = tbl17.cache.cx
+
+if not cx then
+cx = { c = fn35() }
+tbl17.cache.cx = cx
+end
+
+return cx.c
+end
+end
+do -- cy
+local function fn35()
+local v115 = tbl17.k()
+local v116 = tbl17.cx()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local tbl18 = { _trove = v115.new("fighters.RankTracker"), Rank = "Unranked" }
+setmetatable(tbl18, index2)
+tbl18:_Initialize(arg)
+return tbl18
+end
+
+index2._Initialize = function(arg, arg2)
+arg._trove:Connect(arg2:GetAttributeChangedSignal("DisplayELO"), function()
+local v117 = arg
+local userId = arg2.UserId
+local attribute = arg2:GetAttribute("DisplayELO")
+v117.Rank = v116(userId, attribute)
+end)
+
+local userId = arg2.UserId
+local attribute = arg2:GetAttribute("DisplayELO")
+arg.Rank = v116(userId, attribute)
+end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cy = function()
+local cy = tbl17.cache.cy
+
+if not cy then
+cy = { c = fn35() }
+tbl17.cache.cy = cy
+end
+
+return cy.c
+end
+end
+do -- cz
+local function fn35()
+tbl17.aO()
+local index2 = {}
+index2.__index = index2
+index2.Type = "CustomView"
+
+index2.new = function(arg)
+local info2 = v102(arg, "Info")
+local tbl18 = { _data = v102(arg, "Data"), Info = info2, Inner = arg, Name = v102(arg, "Name") }
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.IsEquipped = function(arg)
+return v102(arg.Inner, "IsEquipped")
+end
+
+return index2
+end
+
+tbl17.cz = function()
+local cz = tbl17.cache.cz
+
+if not cz then
+cz = { c = fn35() }
+tbl17.cache.cz = cz
+end
+
+return cz.c
+end
+end
+do -- cA
+local function fn35()
+tbl17.aO()
+local index2 = {}
+index2.__index = index2
+index2.Type = "GunView"
+
+index2.new = function(arg)
+local info2 = v102(arg, "Info")
+
+return setmetatable({
+_data = v102(arg, "Data"),
+Inner = arg,
+Name = v102(arg, "Name"),
+IsRaycast = v102(info2, "IsRaycast"),
+MaxAmmo = v102(info2, "MaxAmmo"),
+}, index2)
+end
+
+index2.GetAmmo = function(arg)
+return v102(arg._data, "Ammo")
+end
+
+index2.GetReloadTimeRemaining = function(arg)
+local now2 = tick()
+local n = v86[186]
+local v115 = v102(arg.Inner, "_reload_cooldown")
+
+if v115 ~= nil then
+n = math.max(v115 - now2, 0)
+end
+
+local v116 = v102(arg.Inner, "_shoot_cooldown_no_ammo")
+local n33
+
+if v116 == nil then
+n33 = n
+else
+n33 = math.max(n, v116 - now2)
+end
+
+return n33
+end
+
+return index2
+end
+
+tbl17.cA = function()
+local ca = tbl17.cache.cA
+
+if not ca then
+local ca2 = { c = fn35() }
+tbl17.cache.cA = ca2
+ca = ca2
+end
+
+return ca.c
+end
+end
+do -- cB
+local function fn35()
+tbl17.aO()
+local index2 = {}
+index2.__index = index2
+index2.Type = "MeleeView"
+
+index2.new = function(arg)
+return setmetatable({ _info = v102(arg, "Info"), _data = v102(arg, "Data"), Inner = arg, Name = v102(arg, "Name") }, index2)
+end
+
+index2.IsDeflecting = function(arg)
+local v115 = v102(arg.Inner, "_deflect_cooldown")
+if v115 == nil then
+return false
+end
+local deflectCooldown = v102(arg._info, "DeflectCooldown")
+return deflectCooldown ~= nil and tick() < v115 - deflectCooldown
+end
+
+index2.IsAttacking = function(arg)
+local v115 = v102(arg.Inner, "_attack_cooldown")
+if v115 == nil then
+return v86[153]
+end
+return tick() < v115
+end
+
+return index2
+end
+
+tbl17.cB = function()
+local cb = tbl17.cache.cB
+
+if not cb then
+local cb2 = { c = fn35() }
+tbl17.cache.cB = cb2
+cb = cb2
+end
+
+return cb.c
+end
+end
+do -- cC
+local function fn35()
+tbl17.aO()
+local index2 = {}
+index2.__index = index2
+index2.Type = "ThrowableView"
+
+index2.new = function(arg)
+return setmetatable({ _data = v102(arg, "Data"), Inner = arg, Name = v102(arg, "Name") }, index2)
+end
+
+return index2
+end
+
+tbl17.cC = function()
+local cc = tbl17.cache.cC
+
+if not cc then
+cc = { c = fn35() }
+tbl17.cache.cC = cc
+end
+
+return cc.c
+end
+end
+do -- cD
+local function fn35()
+local v115 = tbl17.cz()
+tbl17.aM()
+local v116 = tbl17.cA()
+tbl17.aO()
+local v117 = tbl17.cB()
+local v118 = tbl17.g()
+local v119 = tbl17.cC()
+local v120 = tbl17.k()
+local v121 = tbl17.ct()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local remoteItemObserver = v120.new("fighters.remote_item_observer")
+local tbl18 = { _trove = remoteItemObserver, _inner = arg, _items = {}, ItemChanged = remoteItemObserver:Add(v118.new()) }
+setmetatable(tbl18, index2)
+tbl18:_BindToGameEvents()
+return tbl18
+end
+
+index2._BindToGameEvents = function(arg)
+local itemAdded = v102(arg._inner, "ItemAdded")
+local itemRemoved = v102(arg._inner, "ItemRemoved")
+
+arg._trove:Add(v121(itemAdded, function(arg2)
+arg:_AddItem(arg2)
+end))
+
+arg._trove:Add(v121(itemRemoved, function(arg2)
+arg:_RemoveItem(arg2)
+end))
+
+arg._trove:Add(v121(v102(arg._inner, "EquippedItemChanged"), function()
+local equippedItem = v102(arg._inner, "EquippedItem")
+arg.ItemChanged:Fire(equippedItem)
+if equippedItem == nil then
+arg._equippedItem = nil
+return
+end
+arg._equippedItem = arg:_GetViewByInner(equippedItem)
+end))
+
+for _, v122 in v102(arg._inner, "Items") do
+arg:_AddItem(v122)
+end
+
+local equippedItem = v102(arg._inner, "EquippedItem")
+
+if equippedItem ~= nil then
+arg._equippedItem = arg:_GetViewByInner(equippedItem)
+end
+end
+
+index2._AddItem = function(arg, arg2)
+if arg2.Info.Type == "Gun" then
+table.insert(arg._items, v116.new(arg2))
+elseif arg2.Info.Type == "Melee" then
+table.insert(arg._items, v117.new(arg2))
+elseif arg2.Info.Type == "Custom" then
+table.insert(arg._items, v115.new(arg2))
+elseif arg2.Info.Type == "Throwable" then
+table.insert(arg._items, v119.new(arg2))
+end
+end
+
+index2._GetViewByInner = function(arg, arg2)
+for _, v122 in arg._items, nil, nil do
+if v122.Inner == arg2 then
+return v122
+end
+end
+
+return nil
+end
+
+index2._RemoveItem = function(arg, arg2)
+for k, v122 in arg._items, nil, nil do
+if v122.Inner == arg2 then
+table.remove(arg._items, k)
+break
+end
+end
+end
+
+index2.GetItems = function(arg)
+return arg._items
+end
+
+index2.GetEquippedItem = function(arg)
+return arg._equippedItem
+end
+
+index2.EquippedItemAsGun = function(arg)
+local equippedItem = arg._equippedItem
+if equippedItem ~= nil and equippedItem.Type == "GunView" then
+return equippedItem
+end
+return nil
+end
+
+index2.EquippedItemAsMelee = function(arg)
+local equippedItem = arg._equippedItem
+if equippedItem ~= nil and equippedItem.Type == "MeleeView" then
+return equippedItem
+end
+return nil
+end
+
+index2.EquippedItemAsCustom = function(arg)
+local equippedItem = arg._equippedItem
+if equippedItem ~= nil and equippedItem.Type == "CustomView" then
+return equippedItem
+end
+return nil
+end
+
+index2.GetEquippedAmmoState = function(arg)
+local equippedItem = arg._equippedItem
+if equippedItem == nil then
+return nil
+end
+
+if equippedItem.Type == "GunView" then
+return equippedItem:GetAmmo() > 0
+end
+return nil
+end
+
+index2.FindByObjectId = function(arg, arg2)
+for _, v122 in next, arg._items, nil do
+if arg2 == v102(v122._data, "ObjectID") then
+return v122
+end
+end
+
+return nil
+end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+if not flag2 then
+return
+end
+end
+
+return index2
+end
+
+tbl17.cD = function()
+local cd = tbl17.cache.cD
+
+if not cd then
+local cd2 = { c = fn35() }
+tbl17.cache.cD = cd2
+cd = cd2
+end
+
+return cd.c
+end
+end
+do -- cE
+local function fn35()
+local v115 = tbl17.cr()
+tbl17.aM()
+tbl17.aO()
+tbl17.cw()
+local v116 = tbl17.cy()
+local v117 = tbl17.cD()
+local v118 = tbl17.g()
+local v119 = tbl17.k()
+tbl17.cv()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg, arg2)
+local RemoteFighterState = v119.new("fighters.RemoteFighterState")
+
+local tbl18 = {
+_trove = RemoteFighterState,
+_localBindingTrove = RemoteFighterState:Extend(),
+_data = v102(arg2, "Data"),
+Inner = arg2,
+Player = arg,
+Character = RemoteFighterState:Add(v115.new(arg)),
+ItemObserver = RemoteFighterState:Add(v117.new(arg2)),
+_rankTracker = RemoteFighterState:Add(v116.new(arg)),
+EnvironmentId = arg:GetAttribute("EnvironmentID"),
+EnvironmentIdChanged = RemoteFighterState:Add(v118.new()),
+IsEnemy = false,
+EnemyChanged = RemoteFighterState:Add(v118.new()),
+}
+
+tbl18._trove:Connect(arg:GetAttributeChangedSignal("EnvironmentID"), function()
+local attribute = arg:GetAttribute("EnvironmentID")
+tbl18.EnvironmentId = attribute
+tbl18.EnvironmentIdChanged:Fire(attribute)
+end)
+
+return setmetatable(tbl18, index2)
+end
+
+index2.SetLocalFighter = function(arg, arg2)
+arg._localBindingTrove:Clean()
+local localBindingTrove = arg._localBindingTrove
+
+local function fn36()
+local environmentId = arg.EnvironmentId
+local isEnemy
+
+if environmentId == nil or environmentId ~= arg2.EnvironmentId then
+isEnemy = false
+else
+local attribute = arg.Player:GetAttribute("TeamID")
+local attribute2 = arg2.Player:GetAttribute("TeamID")
+isEnemy = attribute2 == nil or attribute ~= attribute2
+end
+
+if isEnemy == arg.IsEnemy then
+return
+end
+arg.IsEnemy = isEnemy
+arg.EnemyChanged:Fire(isEnemy)
+end
+
+fn36()
+localBindingTrove:Connect(arg2.EnvironmentIdChanged, fn36)
+localBindingTrove:Connect(arg2.Player:GetAttributeChangedSignal("TeamID"), fn36)
+localBindingTrove:Connect(arg.EnvironmentIdChanged, fn36)
+localBindingTrove:Connect(arg.Player:GetAttributeChangedSignal("TeamID"), fn36)
+end
+
+index2.GetRank = function(l)return l._rankTracker.Rank;end
+index2.IsInvincible = function(arg)
+local entity = v102(arg.Inner, "Entity")
+local data = entity and v102(entity, "Data")
+return data ~= nil and v102(data, "IsInvincible") == true
+end
+index2.GetCameraRotation = function(arg)
+local value = arg._data and v102(arg._data, "CameraRotation")
+return typeof(value) == "Vector2" and value or Vector2.zero
+end
+index2.IsCrouching = function(arg)
+return arg._data ~= nil and v102(arg._data, "IsCrouching") == true
+end
+index2.Update = function(l,I)l.Character:Update(I);end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cE = function()
+local ce = tbl17.cache.cE
+
+if not ce then
+local ce2 = { c = fn35() }
+tbl17.cache.cE = ce2
+ce = ce2
+end
+
+return ce.c
+end
+end
+do -- cF
+local function fn35()
+tbl17.aM()
+tbl17.aO()
+local v115 = tbl17.k()
+local fighterController = tbl17.aS().FighterController
+local v116 = tbl17.cw()
+local v117 = tbl17.cE()
+local v118 = tbl17.g()
+local v119 = tbl17.ct()
+local localPlayer = cloneref(game:GetService("Players")).LocalPlayer
+local index2 = {}
+index2.__index = index2
+
+index2.new = function()
+local fighters = v115.new("fighters")
+
+local tbl18 = {
+_trove = fighters,
+LocalState = nil,
+StateByPlayer = {},
+StateByModel = {},
+EnemyByPlayer = {},
+LocalStateSet = fighters:Add(v118.new()),
+LocalStateRemoved = fighters:Add(v118.new()),
+RemoteStateAdded = fighters:Add(v118.new()),
+RemoteStateRemoved = fighters:Add(v118.new()),
+RemoteEntityAdded = fighters:Add(v118.new()),
+RemoteEntityRemoved = fighters:Add(v118.new()),
+}
+
+setmetatable(tbl18, index2)
+tbl18:_Initialize()
+return tbl18
+end
+
+index2._Initialize = function(arg)
+local objectAdded = v102(fighterController, "ObjectAdded")
+local objectRemoved = v102(fighterController, "ObjectRemoved")
+local v120 = v102(fighterController, "_player_to_fighter")
+local v121 = getthreadidentity
+local v122 = setthreadidentity
+
+local function fn36(arg2)
+local state = arg2.Character.State
+
+if state.Alive then
+arg.StateByModel[state.Model] = nil
+end
+end
+
+local function fn37(arg2)
+local v123 = v121()
+v122(8)
+local player = v102(arg2, "Player")
+
+if player == localPlayer then
+if arg.LocalState ~= nil then
+arg.LocalStateRemoved:Fire(arg.LocalState)
+arg._trove:Remove(arg.LocalState)
+arg.LocalState = nil
+end
+
+arg:_BuildLocalFighter(player, arg2)
+v122(v123)
+return
+end
+
+local v124 = arg.StateByPlayer[player]
+
+if v124 then
+arg.RemoteStateRemoved:Fire(v124)
+fn36(v124)
+arg._trove:Remove(v124)
+end
+
+arg:_BuildRemoteFighter(player, arg2)
+v122(v123)
+end
+
+local function fn38(arg2)
+if true then
+local v123 = v121()
+v122(8)
+local localState = arg.LocalState
+
+if localState and localState.Inner == arg2 then
+arg._trove:Remove(localState)
+arg.LocalState = nil
+arg.LocalStateRemoved:Fire(localState)
+v122(v123)
+return
+end
+
+local player = v102(arg2, "Player")
+local v124 = arg.StateByPlayer[player]
+
+if v124 and v124.Inner == arg2 then
+fn36(v124)
+arg._trove:Remove(v124)
+arg.StateByPlayer[player] = nil
+arg.EnemyByPlayer[player] = nil
+arg.RemoteStateRemoved:Fire(v124)
+v122(v123)
+return
+end
+
+v122(v123)
+else
+-- (anti-tamper freeze trap removed)
+end
+end
+
+arg._trove:Add(v119(objectAdded, fn37))
+arg._trove:Add(v119(objectRemoved, fn38))
+
+for _, v123 in next, v120, nil do
+fn37(v123)
+end
+end
+
+index2._BuildLocalFighter = function(arg, arg2, arg3)
+local v120 = arg._trove:Add(v116.new(arg2, arg3))
+arg.LocalState = v120
+
+for _, v121 in arg.StateByPlayer, nil, nil do
+v121:SetLocalFighter(v120)
+end
+
+arg.LocalStateSet:Fire(v120)
+end
+
+index2._BuildRemoteFighter = function(arg, arg2, arg3)
+local v120 = arg._trove:Add(v117.new(arg2, arg3))
+
+v120._trove:Connect(v120.Character.Created, function(arg4)
+arg.StateByModel[arg4.Model] = v120
+end)
+
+v120._trove:Connect(v120.Character.Died, function(arg4)
+arg.StateByModel[arg4.Model] = nil
+end)
+
+local state = v120.Character.State
+
+if state.Alive then
+arg.StateByModel[state.Model] = v120
+end
+
+local entityAdded = v102(arg3, "EntityAdded")
+local entityRemoved = v102(arg3, "EntityRemoved")
+
+v120._trove:Add(v119(entityAdded, function(arg4)
+arg.RemoteEntityAdded:Fire(v120, arg4)
+end))
+
+v120._trove:Add(v119(entityRemoved, function(arg4)
+arg.RemoteEntityRemoved:Fire(v120, arg4)
+end))
+
+v120._trove:Connect(v120.EnemyChanged, function(arg4)
+arg.EnemyByPlayer[arg2] = arg4 and v120 or nil
+end)
+
+arg.StateByPlayer[arg2] = v120
+arg.EnemyByPlayer[arg2] = v120.IsEnemy and v120 or nil
+local localState = arg.LocalState
+
+if localState ~= nil then
+v120:SetLocalFighter(localState)
+end
+
+arg.RemoteStateAdded:Fire(v120)
+local entity = v102(arg3, "Entity")
+
+if entity ~= nil then
+arg.RemoteEntityAdded:Fire(v120, entity)
+end
+end
+
+index2.ObserveRemoteStates = function(arg, arg2, arg3)
+local ObserveRemoteStates = v115.new("fighters.ObserveRemoteStates")
+
+for _, v120 in arg.StateByPlayer, nil, nil do
+arg2(v120)
+end
+
+ObserveRemoteStates:Connect(arg.RemoteStateAdded, arg2)
+ObserveRemoteStates:Connect(arg.RemoteStateRemoved, arg3)
+return ObserveRemoteStates
+end
+
+index2.ObserveAllStates = function(arg, arg2, arg3, arg4, arg5)
+local ObserveAllStates = v115.new("fighters.ObserveAllStates")
+local localState = arg.LocalState
+
+if localState then
+arg2(localState)
+end
+
+ObserveAllStates:Connect(arg.LocalStateSet, arg2)
+ObserveAllStates:Connect(arg.LocalStateRemoved, arg3)
+
+for _, v120 in arg.StateByPlayer, nil, nil do
+arg4(v120)
+end
+
+ObserveAllStates:Connect(arg.RemoteStateAdded, arg4)
+ObserveAllStates:Connect(arg.RemoteStateRemoved, arg5)
+return ObserveAllStates
+end
+
+index2.ObserveRemoteEntities = function(arg, arg2, arg3)
+local ObserveRemoteEntities = v115.new("fighters.ObserveRemoteEntities")
+
+for _, v120 in arg.StateByPlayer, nil, nil do
+local entity = v102(v120.Inner, "Entity")
+
+if entity ~= nil then
+arg2(v120, entity)
+end
+end
+
+ObserveRemoteEntities:Connect(arg.RemoteEntityAdded, arg2)
+ObserveRemoteEntities:Connect(arg.RemoteEntityRemoved, arg3)
+return ObserveRemoteEntities
+end
+
+index2.Update = function(l,I)local W=l.LocalState;if W then W:Update(I);end;for W,W_75 in l.StateByPlayer,nil,nil do W_75:Update(I);end;end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cF = function()
+local cf = tbl17.cache.cF
+
+if not cf then
+local cf2 = { c = fn35() }
+tbl17.cache.cF = cf2
+cf = cf2
+end
+
+return cf.c
+end
+end
+do -- cG
+local function fn35()
+tbl17.cr()
+tbl17.cF()
+local localPlayer = cloneref(game:GetService("Players")).LocalPlayer
+local tbl18
+
+tbl18 = {
+getServerOriginOffset = function(arg)
+return Vector3.new(0, arg and 0.25 or 1.75, v86[186])
+end,
+getServerOrigin = function(arg, arg2)
+return arg.RootPart.Position + tbl18.getServerOriginOffset(arg2:IsCrouching())
+end,
+getOneWayPing = function()
+return 0.5 * localPlayer:GetNetworkPing()
+end,
+getEstimatedReplicationDelay = function()
+return tbl18.getOneWayPing() + 0.05
+end,
+getEstimatedRemoteDelay = function()
+return tbl18.getOneWayPing() + 0.016666666666666666
+end,
+}
+
+return tbl18
+end
+
+tbl17.cG = function()
+local cg = tbl17.cache.cG
+
+if not cg then
+cg = { c = fn35() }
+tbl17.cache.cG = cg
+end
+
+return cg.c
+end
+end
+do -- cH
+local function fn35()
+local tbl18
+
+tbl18 = {
+encodeCameraRotation = function(arg)
+if arg ~= arg then
+return utf8.char(0) .. utf8.char(0)
+end
+local n = math.clamp(math.floor(arg.X % math.tau / 3.1415926535897931 / 2 * 256 + 0.5), 0, 255)
+local n33 = math.clamp(math.floor(arg.Y % math.tau / 3.1415926535897931 / 2 * 256 + 0.5), 0, v86[108])
+return utf8.char(n) .. utf8.char(n33)
+end,
+encodeSingle = function(arg)
+if arg ~= arg then
+return utf8.char(0)
+end
+local v115 = v86[186]
+local v116 = v86[108]
+return utf8.char(math.clamp(math.floor(arg % math.tau / 3.1415926535897931 / 2 * v86[137] + 0.5), v115, v116))
+end,
+decodeSingle = function(arg)
+local v115 = v86[56]
+return utf8.codepoint(arg) * 3.1415926535897931 * v115 / 256
+end,
+fromXYToCameraRotation = function(arg, arg2)
+return Vector2.new(arg, arg2) * 3.1415926535897931 * 2 / 256
+end,
+decodeCameraRotation = function(arg)
+local v115, v116 = utf8.codepoint(arg, 1, #arg)
+return tbl18.fromXYToCameraRotation(v115, v116)
+end,
+}
+
+return tbl18
+end
+
+tbl17.cH = function()
+local ch = tbl17.cache.cH
+
+if not ch then
+local ch2 = { c = fn35() }
+tbl17.cache.cH = ch2
+ch = ch2
+end
+
+return ch.c
+end
+end
+do -- cI
+local function fn35()
+tbl17.aM()
+local v115 = tbl17.a()
+local v116 = tbl17.k()
+local fighterController = tbl17.aS().FighterController
+local clientFighterCharacterJoints = tbl17.aS().ClientFighterCharacterJoints
+local updateCameraRotationRemote = tbl17.aS().UpdateCameraRotationRemote
+local get = tbl17.cp().get
+local v117 = tbl17.cH()
+local localPlayer = cloneref(game:GetService("Players")).LocalPlayer
+local index2 = {}
+index2.__index = index2
+
+local function fn36(arg)
+if arg.Kind == "Unnormalized" then
+return utf8.char(math.clamp(arg.Pitch, v86[186], 255)) .. utf8.char(math.clamp(arg.Yaw, 0, 255))
+end
+return v117.encodeSingle(math.rad(arg.Pitch)) .. v117.encodeSingle(math.rad(arg.Yaw))
+end
+
+local function fn37(arg)
+if arg.Kind == "Unnormalized" then
+return v117.fromXYToCameraRotation(arg.Pitch, arg.Yaw)
+end
+local v118 = v117.decodeSingle(v117.encodeSingle(math.rad(arg.Pitch)))
+local v119 = v117.decodeSingle(v117.encodeSingle(math.rad(arg.Yaw)))
+return Vector2.new(v118, v119)
+end
+
+index2.new = function()
+return setmetatable({
+_restoreTrove = v116.new("view_angle_driver.restore"),
+_restoreTask = nil,
+_payloadBySlot = {},
+_winning = nil,
+_fullySuppressed = v86[153],
+_dirty = false,
+}, index2)
+end
+
+index2._LoadJointsHook = function(arg)
+if arg._jointsRestore ~= nil then
+return v115.VoidOk
+end
+local update = v102(clientFighterCharacterJoints, "Update")
+if update == nil then
+return v115.err("ViewAngleDriver", "function_lookup", "Joints.Update method not found")
+end
+
+v103(clientFighterCharacterJoints, "Update", function(arg2, arg3, arg4)
+local clientFighterCharacter = v102(arg2, "ClientFighterCharacter")
+local clientFighter = clientFighterCharacter and v102(clientFighterCharacter, "ClientFighter")
+if clientFighter == nil then
+return update(arg2, arg3, arg4)
+end
+
+if v102(clientFighter, "IsLocalPlayer") == true then
+local winning = arg._winning
+
+if winning ~= nil then
+v103(arg4, "CameraRotationRaw", fn37(winning))
+end
+end
+
+return update(arg2, arg3, arg4)
+end)
+
+arg._jointsRestore = { JointsUpdateMethod = update }
+return v115.VoidOk
+end
+
+index2._LoadReplicationHook = function(arg)
+if arg._replicationRestore ~= nil then
+return v115.VoidOk
+end
+local v118 = getmetatable(fighterController)
+if v118 == nil then
+return v115.err("ViewAngleDriver", "get_metatable", "FighterController metatable not found")
+end
+local v119 = v102(v118, "__index")
+if type(v119) ~= "table" then
+return v115.err("ViewAngleDriver", "get_prototype", "FighterController prototype not found")
+end
+local v120 = v102(v119, "_CameraReplicationLoop")
+if type(v120) ~= "function" then
+return v115.err("ViewAngleDriver", "function_lookup", "FighterController._CameraReplicationLoop method not found")
+end
+local v121 = nil
+local v122 = nil
+
+for k, v123 in debug.getupvalues(v120) do
+if type(v123) ~= "table" then
+v121 = nil
+v122 = nil
+else
+local v124 = getmetatable(v123)
+
+if v124 == nil then
+v121 = nil
+v122 = nil
+else
+local v125 = v102(v124, "__index")
+
+if type(v125) ~= "table" then
+v121 = nil
+v122 = nil
+elseif type(v102(v125, "EncodeCameraRotation")) == "function" then
+v121 = k
+v122 = v123
+break
+else
+v121 = nil
+v122 = nil
+end
+end
+end
+end
+
+if v121 == nil or v122 == nil then
+return v115.err("ViewAngleDriver", "upvalue_search", "Utility upvalue index not found")
+end
+
+debug.setupvalue(v120, v121, { EncodeCameraRotation = function(arg2, arg3)
+if next(arg._payloadBySlot) ~= nil or arg._fullySuppressed then
+v103(fighterController, "_replication_stopped", false)
+return v102(fighterController, "_last_encoded_camera_rotation") or v117.encodeCameraRotation(arg3)
+end
+return v117.encodeCameraRotation(arg3)
+end })
+
+arg._replicationRestore = { CameraReplicationLoopMethod = v120, UtilityIndex = v121, Utility = v122 }
+return v115.VoidOk
+end
+
+index2._Resolve = function(arg)
+local n = -math.huge
+local v118 = nil
+
+for k, v119 in arg._payloadBySlot, nil, nil do
+if k > n then
+n = k
+v118 = v119
+end
+end
+
+arg._winning = v118
+end
+
+index2._CancelRestore = function(arg)
+local restoreTask = arg._restoreTask
+
+if restoreTask ~= nil then
+arg._restoreTask = nil
+arg._restoreTrove:Remove(restoreTask)
+end
+end
+
+index2.SendViewAngles = function(arg, arg2, arg3)
+if arg._payloadBySlot[arg2] == arg3 then
+return v115.VoidOk
+end
+arg._payloadBySlot[arg2] = arg3
+arg._dirty = true
+arg:_Resolve()
+arg:_CancelRestore()
+if arg._winning == nil then
+return v115.VoidOk
+end
+local v118 = arg:_LoadJointsHook()
+if not v118.Ok then
+return v118
+end
+return arg:_LoadReplicationHook()
+end
+
+index2.SendRawCameraRotation = function(arg, arg2)
+fireServer2(updateCameraRotationRemote, arg2, nil)
+end
+
+index2.Suppress = function(arg, fullySuppressed)
+if arg._fullySuppressed == fullySuppressed then
+return v115.VoidOk
+end
+arg._fullySuppressed = fullySuppressed
+if fullySuppressed then
+arg:_CancelRestore()
+return arg:_LoadReplicationHook()
+end
+return v115.VoidOk
+end
+
+index2.ClearAll = function(arg)
+arg:_CancelRestore()
+table.clear(arg._payloadBySlot)
+arg._winning = nil
+arg._dirty = v86[153]
+end
+
+index2.Flush = function(arg)
+if not arg._dirty then
+return
+end
+
+if arg._fullySuppressed then
+return
+end
+local winning = arg._winning
+
+if winning == nil then
+arg._dirty = false
+
+arg._restoreTask = arg._restoreTrove:Add(task.delay(0.05 + localPlayer:GetNetworkPing(), function()
+if arg._winning ~= nil or arg._fullySuppressed then
+return
+end
+fireServer2(updateCameraRotationRemote, v117.encodeCameraRotation(get()), nil)
+end))
+
+return
+end
+
+arg._dirty = false
+fireServer2(updateCameraRotationRemote, fn36(winning), nil)
+end
+
+index2._RevertHooks = function(arg)
+local jointsRestore = arg._jointsRestore
+
+if jointsRestore ~= nil then
+arg._jointsRestore = nil
+v103(clientFighterCharacterJoints, "Update", jointsRestore.JointsUpdateMethod)
+end
+
+local replicationRestore = arg._replicationRestore
+
+if replicationRestore ~= nil then
+arg._replicationRestore = nil
+debug.setupvalue(replicationRestore.CameraReplicationLoopMethod, replicationRestore.UtilityIndex, replicationRestore.Utility)
+end
+end
+
+index2.Destroy = function(arg)
+arg._restoreTrove:Destroy()
+arg._restoreTask = nil
+arg:_RevertHooks()
+end
+
+return index2
+end
+
+tbl17.cI = function()
+local ci = tbl17.cache.cI
+
+if not ci then
+ci = { c = fn35() }
+tbl17.cache.cI = ci
+end
+
+return ci.c
+end
+end
+do -- cJ
+local function fn35()
+tbl17.cr()
+local mechanicsController = tbl17.aS().MechanicsController
+local v115 = tbl17.cs()
+local v116 = tbl17.cG()
+local v117 = tbl17.k()
+local v118 = tbl17.cI()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local characterController = v117.new("context.character_controller")
+local tbl18 = { _trove = characterController, _context = arg, _viewAngleDriver = characterController:Add(v118.new()) }
+setmetatable(tbl18, index2)
+tbl18:_Initialize()
+return tbl18
+end
+
+index2._Initialize = function(arg)
+local function fn36(arg2)
+arg._rootDesync = arg._trove:Add(v115.new(arg2.RootPart))
+end
+
+arg._trove:Connect(arg._context.Created, fn36)
+
+arg._trove:Connect(arg._context.Died, function()
+arg._viewAngleDriver:ClearAll()
+local rootDesync = arg._rootDesync
+
+if rootDesync ~= nil then
+arg._trove:Remove(rootDesync)
+arg._rootDesync = nil
+end
+end)
+
+local state = arg._context.State
+
+if state.Alive then
+fn36(state)
+end
+end
+
+index2.SetServerCFrame = function(arg, arg2)
+local rootDesync = arg._rootDesync
+if rootDesync == nil then
+return
+end
+rootDesync:SetServerCFrame(arg2)
+end
+
+index2.GetServerCFrame = function(arg)
+local rootDesync = arg._rootDesync
+if rootDesync == nil then
+return nil
+end
+return rootDesync:GetServerCFrame()
+end
+
+index2.IsCrouching = function()
+local v119 = v86[34]
+return v102(mechanicsController, "IsCrouching") == v119
+end
+
+if not flag3 then
+return
+end
+
+index2.GetServerOriginAnchor = function(arg)
+local v119 = arg:IsCrouching()
+local rootDesync = arg._rootDesync
+local v120 = v116.getServerOriginOffset(v119)
+return rootDesync ~= nil and rootDesync:GetServerCFrame() + v120 or nil, v119
+end
+
+index2.GetServerHeadOrigin = function(arg)
+return (arg:GetServerOriginAnchor())
+end
+
+index2.GetClientCFrame = function(arg)
+local rootDesync = arg._rootDesync
+if rootDesync == nil then
+return nil
+end
+return rootDesync:GetClientCFrame()
+end
+
+index2.SendViewAngles = function(arg, arg2, arg3)
+arg._viewAngleDriver:SendViewAngles(arg2, arg3)
+end
+
+index2.SendRawCameraRotation = function(arg, arg2)
+arg._viewAngleDriver:SendRawCameraRotation(arg2)
+end
+
+index2.SuppressCameraReplication = function(arg, arg2)
+arg._viewAngleDriver:Suppress(arg2)
+end
+
+index2.FlushViewAngles = function(arg)
+arg._viewAngleDriver:Flush()
+end
+
+index2.HeartbeatUpdate = function(arg)
+local rootDesync = arg._rootDesync
+if rootDesync == nil then
+return
+end
+rootDesync:HeartbeatUpdate()
+end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cJ = function()
+local cj = tbl17.cache.cJ
+
+if not cj then
+cj = { c = fn35() }
+tbl17.cache.cJ = cj
+end
+
+return cj.c
+end
+end
+do -- cK
+local function fn35()
+local enumLibrary = tbl17.aS().EnumLibrary
+local v115 = v102(enumLibrary, "_to_enum")
+local v116 = v102(enumLibrary, "_from_enum")
+
+return {
+encode = function(arg)
+return v102(v115, arg)
+end,
+decode = function(arg)
+return v102(v116, arg)
+end,
+}
+end
+
+tbl17.cK = function()
+local ck = tbl17.cache.cK
+
+if not ck then
+local ck2 = { c = fn35() }
+tbl17.cache.cK = ck2
+ck = ck2
+end
+
+return ck.c
+end
+end
+do -- cL
+local function fn35()
+tbl17.aO()
+local v115 = tbl17.g()
+local v116 = tbl17.k()
+local v117 = tbl17.ct()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local ItemInterfaceAdapter = v116.new("ItemInterfaceAdapter")
+local tbl18 = { _trove = ItemInterfaceAdapter, Instance = v102(arg, "ItemInterface"), Created = ItemInterfaceAdapter:Add(v115.new()) }
+setmetatable(tbl18, index2)
+
+ItemInterfaceAdapter:Add(v117(v102(arg, "InterfaceAdded"), function(instance)
+tbl18.Instance = instance
+tbl18.Created:Fire(instance)
+end))
+
+return tbl18
+end
+
+index2.Destroy = function(arg)
+arg.Instance = nil
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cL = function()
+local cl = tbl17.cache.cL
+
+if not cl then
+local cl2 = { c = fn35() }
+tbl17.cache.cL = cl2
+cl = cl2
+end
+
+return cl.c
+end
+end
+do -- cM
+local function fn35()
+local v115 = tbl17.cK()
+tbl17.aM()
+local v116 = tbl17.cL()
+tbl17.aO()
+local v117 = tbl17.b3()
+local useItemRemote = tbl17.aS().UseItemRemote
+local index2 = {}
+index2.__index = index2
+index2.__type = "Custom"
+
+index2.new = function(arg, arg2)
+local info2 = v102(arg, "Info")
+local data = v102(arg, "Data")
+
+local tbl18 = {
+Index = arg2,
+_data = data,
+Info = info2,
+_clientFighter = v102(arg, "ClientFighter"),
+ItemInterface = v116.new(arg),
+Inner = arg,
+Name = v102(arg, "Name"),
+ObjectId = v102(data, "ObjectID"),
+}
+
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Destroy = function(arg)
+arg.ItemInterface:Destroy()
+end
+
+index2.Equip = function(arg)
+if arg:IsEquipped() then
+return
+end
+local clientFighter = arg._clientFighter
+task.spawn(v117, clientFighter.EquipItem, clientFighter, arg.Index)
+end
+
+index2.IsEquipped = function(arg)
+return v102(arg.Inner, "IsEquipped")
+end
+
+index2.Reload = function(arg)
+local ammo = arg:GetAmmo()
+local ammoReserve = arg:GetAmmoReserve()
+if ammo == nil or ammoReserve == nil or arg:IsReloading() or ammoReserve <= 0 or arg:IsMagFull() then
+return
+end
+local flag19 = ammo == 0
+local animations = v102(v102(v102(arg.Inner, "ViewModel"), "Info"), "Animations")
+local flag20 = (v102(animations, "EmptyReload") ~= nil or v102(animations, "EmptyReloadStart") ~= nil) and flag19
+local str7 = "Reload"
+
+if flag20 then
+str7 = "EmptyReload"
+end
+
+local v118 = v102(arg.Info, animations[str7])
+if v118 == nil then
+return
+end
+local length = v118.Length
+local n = tick() + length
+local inner = arg.Inner
+v103(inner, "_reload_cooldown", n)
+v103(inner, "_reload_cancel_cooldown", flag19 and n or tick() + 0.25)
+local actionTimestamp = v118.ActionTimestamp
+v103(inner, "_reload_cancel_expiration", tick() + actionTimestamp)
+local tbl18 = { ["\1"] = v115.encode(str7) }
+fireServer(useItemRemote, arg.ObjectId, v115.encode("StartReloading"), tbl18, nil)
+end
+
+index2.IsAmmoBased = function(arg)
+return v102(arg._data, "Ammo") ~= nil
+end
+
+index2.GetAmmo = function(arg)
+return v102(arg._data, "Ammo")
+end
+
+index2.GetAmmoReserve = function(arg)
+return v102(arg._data, "AmmoReserve")
+end
+
+index2.IsMagFull = function(arg)
+local ammo = arg:GetAmmo()
+if ammo == nil then
+return nil
+end
+local maxAmmo = v102(arg.Info, "MaxAmmo")
+return maxAmmo ~= nil and ammo >= maxAmmo
+end
+
+index2.IsReloading = function(arg)
+local v118 = v102(arg.Inner, "_reload_cooldown")
+return v118 ~= nil and tick() < v118
+end
+
+return index2
+end
+
+tbl17.cM = function()
+local cm = tbl17.cache.cM
+
+if not cm then
+cm = { c = fn35() }
+tbl17.cache.cM = cm
+end
+
+return cm.c
+end
+end
+do -- cN
+local function fn35()
+return {
+encode = function(arg)
+local v115, v116, v117 = arg:ToOrientation()
+return { ["\0"] = arg.X, ["\1"] = arg.Y, ["\2"] = arg.Z, ["\3"] = v115, ["\4"] = v116, ["\5"] = v117 }
+end,
+decode = function(arg)
+local v115 = v86[68]
+if type(arg) ~= v115 then
+return nil
+end
+local v116 = arg["\0"]
+local v117 = arg["\1"]
+local v118 = arg["\2"]
+local v119 = arg["\3"]
+local v120 = arg["\4"]
+local v121 = arg["\5"]
+local flag19 = type(v116) ~= "number"
+
+if not flag19 then
+local v122 = v86[95]
+flag19 = type(v117) ~= v122
+end
+
+if flag19 or type(v118) ~= "number" or type(v119) ~= "number" or type(v120) ~= "number" or type(v121) ~= "number" then
+return nil
+end
+return CFrame.new(v116, v117, v118) * CFrame.fromOrientation(v119, v120, v121)
+end,
+}
+end
+
+tbl17.cN = function()
+local cn = tbl17.cache.cN
+
+if not cn then
+local cn2 = { c = fn35() }
+tbl17.cache.cN = cn2
+cn = cn2
+end
+
+return cn.c
+end
+end
+do -- cO
+local function fn35()
+return function(arg, arg2, arg3)
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Include
+raycastParams.FilterDescendantsInstances = { arg2 }
+local hit = workspace:Raycast(arg, arg3 - arg, raycastParams)
+if hit == nil then
+return nil
+end
+local v115 = arg2.CFrame:PointToObjectSpace(hit.Position)
+if v115 == Vector3.zero then
+return nil
+end
+return v115
+end
+end
+
+tbl17.cO = function()
+local co = tbl17.cache.cO
+
+if not co then
+co = { c = fn35() }
+tbl17.cache.cO = co
+end
+
+return co.c
+end
+end
+do -- cP
+local function fn35()
+local v115 = tbl17.cN()
+local v116 = tbl17.cO()
+
+return function(arg, arg2)
+if arg2 == nil then
+return nil, nil
+end
+local position = arg.Position
+local part = arg2.Part
+local objectSpace = arg2.ObjectSpace or v116(position, part, part.Position)
+if objectSpace == nil or objectSpace == Vector3.zero then
+return nil, nil
+end
+return part, objectSpace ~= nil and v115.encode(CFrame.new(objectSpace)) or v115.encode(CFrame.new(part:GetClosestPointOnSurface(position)))
+end
+end
+
+tbl17.cP = function()
+local cp = tbl17.cache.cP
+
+if not cp then
+cp = { c = fn35() }
+tbl17.cache.cP = cp
+end
+
+return cp.c
+end
+end
+do -- cQ
+local function fn35()
+local itemLibrary = tbl17.aS().ItemLibrary
+
+return function(arg)
+local v115 = v102(v102(itemLibrary, "Items"), arg)
+return v115 ~= nil and v102(v115, "EquipCooldown") or nil
+end
+end
+
+tbl17.cQ = function()
+local cq = tbl17.cache.cQ
+
+if not cq then
+cq = { c = fn35() }
+tbl17.cache.cQ = cq
+end
+
+return cq.c
+end
+end
+do -- cR
+local function fn35()
+local v115 = tbl17.cN()
+local v116 = tbl17.cK()
+tbl17.aM()
+tbl17.aO()
+local useItemRemote = tbl17.aS().UseItemRemote
+local v117 = tbl17.cL()
+local v118 = tbl17.cG()
+local v119 = tbl17.cP()
+local v120 = tbl17.cQ()
+local v121 = tbl17.b3()
+local index2 = {}
+index2.__index = index2
+index2.__type = "Gun"
+
+index2.new = function(arg, arg2)
+local info2 = v102(arg, "Info")
+local data = v102(arg, "Data")
+
+local tbl18 = {
+Index = arg2,
+_data = data,
+Info = info2,
+_clientFighter = v102(arg, "ClientFighter"),
+_aimScopePercent = v102(info2, "AimScopePercent"),
+_equipRequestedAt = nil,
+_expectedAmmoRaw = v102(data, "Ammo"),
+_nextLikelyShotRequestAt = 0,
+_outstandingAmmoSpend = 0,
+_outstandingAmmoSpendDeadline = nil,
+ItemInterface = v117.new(arg),
+Inner = arg,
+Name = v102(arg, "Name"),
+ObjectId = v102(data, "ObjectID"),
+IsRaycast = v102(info2, "IsRaycast"),
+MaxAmmo = v102(info2, "MaxAmmo"),
+ShotRequestCount = 0,
+EquipCooldown = v120(v102(arg, "Name")) or 0,
+}
+
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Destroy = function(arg)
+arg.ItemInterface:Destroy()
+end
+
+index2._ClearPendingShots = function(arg)
+arg._expectedAmmoRaw = arg:GetAmmo()
+arg._nextLikelyShotRequestAt = v86[186]
+arg._outstandingAmmoSpend = v86[186]
+arg._outstandingAmmoSpendDeadline = nil
+end
+
+index2._ReconcilePendingShots = function(arg, arg2)
+local ammo = arg:GetAmmo()
+local expectedAmmoRaw = arg._expectedAmmoRaw
+if ammo > expectedAmmoRaw then
+arg:_ClearPendingShots()
+return
+end
+
+if ammo < expectedAmmoRaw then
+arg._outstandingAmmoSpend = math.max(arg._outstandingAmmoSpend - expectedAmmoRaw - ammo, v86[186])
+arg._expectedAmmoRaw = ammo
+
+if arg._outstandingAmmoSpend <= 0 then
+arg._outstandingAmmoSpendDeadline = nil
+end
+end
+
+local outstandingAmmoSpendDeadline = arg._outstandingAmmoSpendDeadline
+
+if outstandingAmmoSpendDeadline ~= nil and arg2 >= outstandingAmmoSpendDeadline then
+arg._outstandingAmmoSpend = 0
+arg._nextLikelyShotRequestAt = 0
+arg._outstandingAmmoSpendDeadline = nil
+end
+end
+
+index2._RecordPendingShot = function(arg)
+local now2 = os.clock()
+arg:_ReconcilePendingShots(now2)
+if now2 < arg._nextLikelyShotRequestAt then
+return
+end
+local n = math.max(arg._expectedAmmoRaw - arg._outstandingAmmoSpend, 0)
+if n <= v86[186] then
+return
+end
+local n33 = math.max(arg.Info.ShootBurst or 1, 1)
+arg._outstandingAmmoSpend = arg._outstandingAmmoSpend + math.min(n33, n)
+arg._outstandingAmmoSpendDeadline = now2 + v118.getEstimatedRemoteDelay() + v118.getEstimatedReplicationDelay()
+local quickShotCooldown = arg:IsFanFired() and v102(arg.Info, "QuickShotCooldown") or nil
+if quickShotCooldown ~= nil then
+arg._nextLikelyShotRequestAt = now2 + quickShotCooldown
+return
+end
+local shootBurstCooldown = arg.Info.ShootBurstCooldown or 0
+arg._nextLikelyShotRequestAt = now2 + (n33 - 1) * shootBurstCooldown + math.max(arg.Info.ShootCooldown or 0, shootBurstCooldown)
+end
+
+index2.Equip = function(arg)
+if arg:IsEquipped() then
+arg._equipRequestedAt = nil
+return
+end
+local now2 = tick()
+local equipRequestedAt = arg._equipRequestedAt
+if equipRequestedAt ~= nil and now2 < equipRequestedAt + arg.EquipCooldown then
+return
+end
+arg:_ClearPendingShots()
+arg._equipRequestedAt = now2
+local clientFighter = arg._clientFighter
+task.spawn(v121, clientFighter.EquipItem, clientFighter, arg.Index)
+end
+
+index2.IsEquipped = function(arg)
+return (v102(arg.Inner, "IsEquipped"))
+end
+
+index2.IsFanFired = function(arg)
+return arg.Name == "Revolver"
+end
+
+index2.ShootAt = function(arg, arg2, arg3, arg4)
+local v122, v123 = v119(arg2, arg4)
+arg:ShootEncoded(v115.encode(arg2), v115.encode(arg3), v122, v123)
+end
+
+index2.ShootEncoded = function(arg, arg2, arg3, arg4, arg5)
+local tbl18 = { ["\0"] = arg2, ["\1"] = arg3, ["\2"] = arg4, ["\3"] = arg5, ["\4"] = arg:IsFanFired() or nil }
+local tbl19 = arg.IsRaycast and { ["\1"] = tbl18, ["\2"] = true } or { ["\1"] = tbl18 }
+fireServer(useItemRemote, arg.ObjectId, v116.encode("StartShooting"), tbl19, nil)
+arg.ShotRequestCount = arg.ShotRequestCount + 1
+arg:_RecordPendingShot()
+end
+
+index2.IsFullyAiming = function(arg)
+local isAiming = v102(arg._data, "IsAiming")
+local aimScopePercent = arg._aimScopePercent
+local currentAimValue = v102(v102(arg.Inner, "ViewModel"), "CurrentAimValue")
+return isAiming and (aimScopePercent == nil or currentAimValue >= aimScopePercent)
+end
+
+index2.Reload = function(arg)
+if arg:IsReloading() or arg:GetAmmoReserve() <= 0 or arg:IsMagFull() then
+return false
+end
+local Reload = v116.encode("Reload")
+fireServer(useItemRemote, arg.ObjectId, v116.encode("StartReloading"), { ["\1"] = Reload, ["\2"] = Reload }, nil)
+return true
+end
+
+index2.GetAmmo = function(arg)
+return v102(arg._data, "Ammo")
+end
+
+index2.GetExpectedAmmoAfterPendingShots = function(arg)
+arg:_ReconcilePendingShots(os.clock())
+return math.max(arg._expectedAmmoRaw - arg._outstandingAmmoSpend, 0)
+end
+
+index2.GetAmmoReserve = function(arg)
+return v102(arg._data, "AmmoReserve") or math.huge
+end
+
+index2.GetShootTimeRemaining = function(arg)
+local v122 = v86[186]
+return math.max(v102(arg.Inner, "_shoot_cooldown") - tick(), v122)
+end
+
+index2.IsOnShootCooldown = function(arg)
+return arg:GetShootTimeRemaining() > 0
+end
+
+index2.GetReloadTimeRemaining = function(arg)
+local now2 = tick()
+local v122 = v102(arg.Inner, "_reload_cooldown")
+local n = 0
+
+if v122 ~= nil then
+n = math.max(v122 - now2, 0)
+end
+
+local v123 = v102(arg.Inner, "_shoot_cooldown_no_ammo")
+local n33
+
+if v123 ~= nil then
+n33 = math.max(n, v123 - now2)
+else
+n33 = n
+end
+
+return n33
+end
+
+index2.GetEquipTimeRemaining = function(arg)
+if not arg:IsEquipped() then
+local equipRequestedAt = arg._equipRequestedAt
+if equipRequestedAt == nil then
+return arg.EquipCooldown
+end
+return math.max(equipRequestedAt + arg.EquipCooldown - tick(), 0)
+end
+
+arg._equipRequestedAt = nil
+local v122 = v102(arg.Inner, "_equip_cooldown")
+if v122 == nil then
+return 0
+end
+return math.max(v122 - tick(), 0)
+end
+
+index2.IsReloading = function(arg)
+return arg:GetReloadTimeRemaining() > 0
+end
+
+index2.IsMagFull = function(arg)
+local maxAmmo = arg.MaxAmmo
+return arg:GetAmmo() >= maxAmmo
+end
+
+return index2
+end
+
+tbl17.cR = function()
+local cr = tbl17.cache.cR
+
+if not cr then
+cr = { c = fn35() }
+tbl17.cache.cR = cr
+end
+
+return cr.c
+end
+end
+do -- cS
+local function fn35()
+local v115 = tbl17.cN()
+local v116 = tbl17.cK()
+tbl17.aM()
+local v117 = tbl17.cL()
+tbl17.aO()
+local v118 = tbl17.b3()
+local useItemRemote = tbl17.aS().UseItemRemote
+local v119 = tbl17.cP()
+local index2 = {}
+index2.__index = index2
+index2.__type = "Melee"
+
+index2.new = function(arg, arg2)
+local info2 = v102(arg, "Info")
+local data = v102(arg, "Data")
+
+local tbl18 = {
+Index = arg2,
+_info = info2,
+_clientFighter = v102(arg, "ClientFighter"),
+ItemInterface = v117.new(arg),
+Inner = arg,
+Name = v102(arg, "Name"),
+ObjectId = v102(data, "ObjectID"),
+}
+
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Destroy = function(arg)
+arg.ItemInterface:Destroy()
+end
+
+index2.Equip = function(arg)
+if arg:IsEquipped() then
+return
+end
+local clientFighter = arg._clientFighter
+task.spawn(v118, clientFighter.EquipItem, clientFighter, arg.Index)
+end
+
+index2.IsEquipped = function(arg)
+return (v102(arg.Inner, "IsEquipped"))
+end
+
+index2.IsOnDashCooldown = function(arg)
+local v120 = v102(arg.Inner, "_dash_cooldown")
+return v120 ~= nil and tick() < v120
+end
+
+index2.Dash = function(arg)
+if v102(arg._info, "DashCooldown") == nil then
+if n26 > 4815 then
+-- (anti-tamper freeze trap removed)
+end
+
+return
+end
+
+local clientFighter = arg._clientFighter
+v118(clientFighter.Input, clientFighter, "StartAiming")
+end
+
+index2.Attack = function(arg, arg2, arg3, arg4)
+local v120, v121 = v119(arg2, arg4)
+arg:AttackEncoded(v115.encode(arg2), v115.encode(arg3), v120, v121)
+end
+
+index2.AttackEncoded = function(arg, arg2, arg3, arg4, arg5)
+local tbl18 = {
+["\1"] = { ["\0"] = arg2, ["\1"] = arg3, ["\2"] = arg4, ["\3"] = arg5 },
+["\2"] = v116.encode("AttackAnimation1") or v116.encode("Attack1"),
+}
+
+fireServer(useItemRemote, arg.ObjectId, v116.encode("StartShooting"), tbl18, nil)
+end
+
+index2.HeavyAttack = function(arg, arg2, arg3, arg4)
+local v120, v121 = v119(arg2, arg4)
+arg:HeavyAttackEncoded(v115.encode(arg2), v115.encode(arg3), v120, v121)
+end
+
+index2.HeavyAttackEncoded = function(arg, arg2, arg3, arg4, arg5)
+local tbl18 = {
+["\1"] = { ["\0"] = arg2, ["\1"] = arg3, ["\2"] = arg4, ["\3"] = arg5 },
+["\2"] = v116.encode("HeavyAttackAnimation1") or v116.encode("HeavyAttack1"),
+}
+
+fireServer(useItemRemote, arg.ObjectId, v116.encode("StartAiming"), tbl18, nil)
+end
+
+return index2
+end
+
+tbl17.cS = function()
+local cs = tbl17.cache.cS
+
+if not cs then
+cs = { c = fn35() }
+tbl17.cache.cS = cs
+end
+
+return cs.c
+end
+end
+do -- cT
+local function fn35()
+local v115 = tbl17.cK()
+tbl17.aM()
+local v116 = tbl17.cL()
+tbl17.aO()
+local v117 = tbl17.b3()
+local useItemRemote = tbl17.aS().UseItemRemote
+local index2 = {}
+index2.__index = index2
+index2.__type = "Throwable"
+
+index2.new = function(arg, arg2)
+local info2 = v102(arg, "Info")
+local data = v102(arg, "Data")
+
+local tbl18 = {
+Index = arg2,
+_data = data,
+_clientFighter = v102(arg, "ClientFighter"),
+ItemInterface = v116.new(arg),
+Info = info2,
+Inner = arg,
+Name = v102(arg, "Name"),
+ObjectId = v102(data, "ObjectID"),
+}
+
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Destroy = function(arg)
+arg.ItemInterface:Destroy()
+end
+
+index2.Equip = function(arg)
+if arg:IsEquipped() then
+return
+end
+local clientFighter = arg._clientFighter
+task.spawn(v117, clientFighter.EquipItem, clientFighter, arg.Index)
+end
+
+index2.IsEquipped = function(arg)
+return (v102(arg.Inner, "IsEquipped"))
+end
+
+index2.IsOnCooldown = function(arg)
+local v118 = v102(arg.Inner, "_throw_cooldown")
+return v118 ~= nil and tick() < v118
+end
+
+index2.Throw = function(arg)
+local inner = arg.Inner
+local startShooting = v117(inner.Input, inner, "StartShooting")
+local v118 = v102(inner, "_is_throwing")
+if startShooting == false or v118 == nil then
+return
+end
+
+if tick() < v118 + 0.6 then
+return
+end
+local v119, v120, v121, v122, v123 = v117(inner.FinishShooting, inner, false)
+if v119 == false then
+return
+end
+fireServer(useItemRemote, v102(arg._data, "ObjectID"), v115.encode(v120), { ["\0"] = v121, ["\1"] = v122, ["\2"] = v123 }, nil)
+end
+
+return index2
+end
+
+tbl17.cT = function()
+local ct = tbl17.cache.cT
+
+if not ct then
+ct = { c = fn35() }
+tbl17.cache.cT = ct
+end
+
+return ct.c
+end
+end
+do -- cU
+local function fn35()
+local v115 = tbl17.cM()
+tbl17.cF()
+local v116 = tbl17.cR()
+tbl17.aO()
+local v117 = tbl17.cS()
+local v118 = tbl17.g()
+local v119 = tbl17.cT()
+local v120 = tbl17.k()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local itemBehaviors = v120.new("context.item_behaviors")
+
+local tbl18 = {
+_trove = itemBehaviors,
+_localFighterState = arg,
+_items = {},
+_itemByInner = {},
+_itemByObjectId = {},
+_itemByName = {},
+ItemAdded = itemBehaviors:Add(v118.new()),
+ItemRemoved = itemBehaviors:Add(v118.new()),
+EquippedItemChanged = itemBehaviors:Add(v118.new()),
+}
+
+setmetatable(tbl18, index2)
+return tbl18
+end
+
+index2.Destroy = function(arg)
+for _, v121 in arg._items, nil, nil do
+v121:Destroy()
+end
+
+arg._trove:Destroy()
+end
+
+index2.Initialize = function(arg)
+for k, v121 in arg._localFighterState:GetItems() do
+arg:AddItem(v121, k)
+end
+
+local function fn36()
+for k, v121 in arg._localFighterState:GetItems() do
+local v122 = arg:FindByInner(v121)
+
+if v122 ~= nil then
+arg._items[v122].Index = k
+end
+end
+end
+
+arg._trove:Add(arg._localFighterState:OnItemAddedSignal(function(arg2)
+local v121 = arg:AddItem(arg2, table.find(arg._localFighterState:GetItems(), arg2) or #arg._items)
+fn36()
+
+if v121 ~= nil then
+arg.ItemAdded:Fire(v121)
+end
+end))
+
+arg._trove:Add(arg._localFighterState:OnItemRemovedSignal(function(arg2)
+local v121, v122 = arg:FindByInner(arg2)
+
+if v121 ~= nil and v122 ~= nil then
+table.remove(arg._items, v121)
+arg._itemByObjectId[v122.ObjectId] = nil
+arg._itemByName[arg2.Name] = nil
+arg._itemByInner[arg2] = nil
+fn36()
+arg.ItemRemoved:Fire(v122)
+v122:Destroy()
+end
+end))
+
+local function fn37(arg2)
+if arg2 ~= nil then
+arg.EquippedItemChanged:Fire(arg._itemByInner[arg2])
+else
+arg.EquippedItemChanged:Fire(nil)
+end
+end
+
+arg._trove:Add(arg._localFighterState:OnEquippedItemChangedSignal(fn37))
+fn37(arg._localFighterState:GetEquippedItem())
+end
+
+index2.AddItem = function(arg, arg2, arg3)
+if arg._itemByInner[arg2] then
+return nil
+end
+local v121
+
+if arg2.Info.Type == "Melee" then
+v121 = v117.new(arg2, arg3)
+elseif arg2.Info.Type == "Gun" then
+v121 = v116.new(arg2, arg3)
+elseif arg2.Info.Type == "Throwable" then
+v121 = v119.new(arg2, arg3)
+else
+if arg2.Info.Type ~= "Custom" then
+return nil
+end
+v121 = v115.new(arg2, arg3)
+end
+
+table.insert(arg._items, v121)
+arg._itemByInner[arg2] = v121
+arg._itemByObjectId[v121.ObjectId] = v121
+arg._itemByName[v121.Name] = v121
+return v121
+end
+
+index2.FindByInner = function(arg, arg2)
+for k, v121 in arg._items, nil, nil do
+if v121.Inner == arg2 then
+return k, v121
+end
+end
+
+return nil, nil
+end
+
+index2.FindByObjectId = function(arg, arg2)
+return arg._itemByObjectId[arg2]
+end
+
+index2.FindMeleeByName = function(arg, arg2)
+local v121 = arg._itemByName[arg2]
+if v121 == nil or v121.__type ~= "Melee" then
+return nil
+end
+return v121
+end
+
+index2.FindGunByName = function(arg, arg2)
+local v121 = arg._itemByName[arg2]
+if v121 == nil or v121.__type ~= "Gun" then
+return nil
+end
+return v121
+end
+
+index2.FindThrowableByName = function(arg, arg2, arg3)
+local v121 = arg._itemByName[arg2]
+if v121 == nil or v121.__type ~= "Throwable" then
+return nil
+end
+
+if arg3 and v121:IsOnCooldown() then
+return nil
+end
+return v121
+end
+
+index2.FindCustomByName = function(arg, arg2)
+local v121 = arg._itemByName[arg2]
+if v121 == nil or v121.__type ~= "Custom" then
+return nil
+end
+return v121
+end
+
+index2.GetHitscanGun = function(arg)
+for _, v121 in arg._items, nil, nil do
+if v121.__type == "Gun" and v121.IsRaycast then
+return v121
+end
+end
+
+return nil
+end
+
+index2.GetEquipped = function(arg)
+local equippedItem = arg._localFighterState:GetEquippedItem()
+if equippedItem == nil then
+return nil
+end
+return arg._itemByInner[equippedItem]
+end
+
+index2.GetEquippedAmmoState = function(arg)
+local equipped = arg:GetEquipped()
+if equipped == nil then
+return nil
+end
+
+if equipped.__type == "Gun" then
+local v121 = v86[186]
+return equipped:GetAmmo() > v121
+end
+return nil
+end
+
+index2.EquippedItemAsGun = function(arg)
+local equipped = arg:GetEquipped()
+if equipped ~= nil and equipped.__type == "Gun" then
+return equipped
+end
+return nil
+end
+
+index2.EquippedItemAsMelee = function(arg)
+local equipped = arg:GetEquipped()
+if equipped ~= nil and equipped.__type == "Melee" then
+return equipped
+end
+return nil
+end
+
+index2.EquippedItemAsThrowable = function(arg)
+local equipped = arg:GetEquipped()
+if equipped ~= nil and equipped.__type == "Throwable" then
+return equipped
+end
+return nil
+end
+
+index2.EquippedItemAsCustom = function(arg)
+local equipped = arg:GetEquipped()
+if equipped ~= nil and equipped.__type == "Custom" then
+return equipped
+end
+return nil
+end
+
+index2.HasEquippedGun = function(arg)
+return arg:EquippedItemAsGun() ~= nil
+end
+
+index2.GetEquippedGunName = function(arg)
+local v121 = arg:EquippedItemAsGun()
+return v121 ~= nil and v121.Inner.Name or nil
+end
+
+index2.GetItems = function(arg)
+return arg._items
+end
+
+return index2
+end
+
+tbl17.cU = function()
+local cu = tbl17.cache.cU
+
+if not cu then
+cu = { c = fn35() }
+tbl17.cache.cU = cu
+end
+
+return cu.c
+end
+end
+do -- cV
+local function fn35()
+return tbl17.g().new().Once
+end
+
+tbl17.cV = function()
+local cv = tbl17.cache.cV
+
+if not cv then
+cv = { c = fn35() }
+tbl17.cache.cV = cv
+end
+
+return cv.c
+end
+end
+do -- cW
+local function fn35()
+tbl17.cF()
+local v115 = tbl17.ay()
+local pickWeaponsRemote = tbl17.aS().PickWeaponsRemote
+local shootingRangeTrashItemsEvent = tbl17.aS().ShootingRangeTrashItemsEvent
+tbl17.g()
+local v116 = tbl17.cv()
+local v117 = tbl17.cV()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+return setmetatable({ _fighterState = arg }, index2)
+end
+
+index2.PickLoadoutAsync = function(arg, arg2)
+local alive = arg._fighterState.Character.State.Alive
+if not v116(arg._fighterState.Inner, "CanPickWeapons") or not alive then
+return v115.reject()
+end
+
+if #arg._fighterState:GetItems() < 4 then
+return arg:_ForcePickLoadoutAsync(arg2)
+end
+
+if v116(arg._fighterState.Inner, "IsInShootingRange") then
+return arg:_TrashRangeItemsAsync():andThen(function()
+return arg:_ForcePickLoadoutAsync(arg2)
+end)
+end
+return v115.reject()
+end
+
+index2._ForcePickLoadoutAsync = function(arg, arg2)
+fireServer(pickWeaponsRemote, arg2)
+local v118 = nil
+
+return v115.new(function(arg3)
+v118 = v117(arg._fighterState.Inner.ItemAdded, function()
+arg3()
+end)
+end):timeout(1.5):finally(function()
+v118:Disconnect()
+end)
+end
+
+index2._TrashRangeItemsAsync = function(arg)
+fireServer(shootingRangeTrashItemsEvent)
+local v118 = nil
+
+return v115.new(function(arg2)
+v118 = v117(arg._fighterState.Inner.ItemRemoved, function()
+arg2()
+end)
+end):timeout(1.5):finally(function()
+v118:Disconnect()
+end)
+end
+
+return index2
+end
+
+tbl17.cW = function()
+local cw = tbl17.cache.cW
+
+if not cw then
+local cw2 = { c = fn35() }
+tbl17.cache.cW = cw2
+cw = cw2
+end
+
+return cw.c
+end
+end
+do -- cX
+local function fn35()
+local v115 = tbl17.cJ()
+tbl17.cF()
+local v116 = tbl17.cU()
+local v117 = tbl17.cW()
+tbl17.cw()
+local v118 = tbl17.g()
+local v119 = tbl17.k()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg)
+local context = v119.new("context")
+
+local tbl18 = {
+_trove = context,
+_contextTrove = context:Extend(),
+ContextAdded = context:Add(v118.new()),
+ContextRemoved = context:Add(v118.new()),
+_fighters = arg,
+}
+
+setmetatable(tbl18, index2)
+tbl18:_Initialize()
+return tbl18
+end
+
+index2._ClearContext = function(arg)
+local inner = arg.Inner
+if inner == nil then
+arg._contextTrove:Clean()
+return
+end
+arg.Inner = nil
+arg.ContextRemoved:Fire(inner)
+arg._contextTrove:Clean()
+end
+
+index2._Initialize = function(arg)
+local function fn36(arg2)
+arg:_ClearContext()
+local v120 = arg._contextTrove:Add(v115.new(arg2.Character))
+local v121 = arg._contextTrove:Add(v116.new(arg2))
+v121:Initialize()
+local inner = { CharacterController = v120, FighterState = arg2, ItemBehaviors = v121, LoadoutPicker = v117.new(arg2) }
+arg.Inner = inner
+arg.ContextAdded:Fire(inner)
+end
+
+arg._trove:Connect(arg._fighters.LocalStateSet, fn36)
+
+arg._trove:Connect(arg._fighters.LocalStateRemoved, function()
+arg:_ClearContext()
+end)
+
+local localState = arg._fighters.LocalState
+
+if localState then
+fn36(localState)
+end
+end
+
+index2.ObserveContext = function(arg, arg2, arg3)
+local v120 = v119.new(arg2)
+local v121 = v120:Extend()
+
+local function fn36()
+v121:Clean()
+end
+
+local function fn37(arg4)
+fn36()
+arg3(arg4, v121)
+end
+
+v120:Connect(arg.ContextAdded, fn37)
+v120:Connect(arg.ContextRemoved, fn36)
+local inner = arg.Inner
+
+if inner ~= nil then
+fn37(inner)
+end
+
+return v120
+end
+
+index2.HeartbeatUpdate = function(arg)
+local inner = arg.Inner
+
+if inner ~= nil then
+inner.CharacterController:HeartbeatUpdate()
+end
+end
+
+index2.FlushViewAngles = function(arg)
+local inner = arg.Inner
+
+if inner ~= nil then
+inner.CharacterController:FlushViewAngles()
+end
+end
+
+index2.Destroy = function(arg)
+arg:_ClearContext()
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.cX = function()
+local cx = tbl17.cache.cX
+
+if not cx then
+cx = { c = fn35() }
+tbl17.cache.cX = cx
+end
+
+return cx.c
+end
+end
+do -- di
+local function fn35()
+local v115 = tbl17.bG()
+tbl17.cF()
+tbl17.cX()
+local v116 = tbl17.k()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg, arg2)
+local tbl18 = { _trove = v116.new("always_backstab"), _fighters = arg2 }
+setmetatable(tbl18, index2)
+tbl18:_Initialize(arg)
+return tbl18
+end
+
+index2._Initialize = function(arg, arg2)
+arg._trove:Add(arg2:ObserveContext("always_backstab", function(innerContext)
+arg._innerContext = innerContext
+end))
+
+arg._trove:Connect(arg2.ContextRemoved, function()
+arg._innerContext = nil
+end)
+end
+
+index2.Update = function(arg)
+local innerContext = arg._innerContext
+if innerContext == nil then
+return
+end
+
+if innerContext.ItemBehaviors:FindMeleeByName("Knife") == nil then
+return
+end
+local serverHeadOrigin = innerContext.CharacterController:GetServerHeadOrigin()
+if serverHeadOrigin == nil then
+innerContext.CharacterController:SendViewAngles(10, nil)
+return
+end
+local v117 = arg:_FindClosestEnemy(serverHeadOrigin.Position)
+if v117 == nil then
+innerContext.CharacterController:SendViewAngles(v86[133], nil)
+return
+end
+local v118, v119 = v117.CFrame:ToOrientation()
+innerContext.CharacterController:SendViewAngles(10, { Kind = "Normalized", Pitch = math.deg(v118), Yaw = math.deg(v119) })
+end
+
+index2._FindClosestEnemy = function(arg, arg2)
+local huge = math.huge
+local v117 = nil
+
+for _, v118 in arg._fighters.EnemyByPlayer, nil, nil do
+local state = v118.Character.State
+
+if state.Alive then
+local rootPart = state.RootPart
+local magnitude = (rootPart.Position - arg2).Magnitude
+
+if magnitude < 120 and magnitude < huge then
+huge = magnitude
+v117 = rootPart
+end
+end
+end
+
+return v117
+end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+end
+
+return index2
+end
+
+tbl17.di = function()
+local di = tbl17.cache.di
+
+if not di then
+local di2 = { c = fn35() }
+tbl17.cache.di = di2
+di = di2
+end
+
+return di.c
+end
+end
+do -- dl
+local function fn35()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg, arg2)
+return setmetatable({ _handleSetEnabled = arg, _handleDestroy = arg2, Enabled = v86[153] }, index2)
+end
+
+index2.SetHandler = function(arg, handler)
+arg.Handler = handler
+end
+
+index2.SetEnabled = function(arg, enabled)
+arg.Enabled = enabled
+arg._handleSetEnabled(enabled)
+end
+
+index2.Destroy = function(arg)
+arg._handleDestroy()
+end
+
+return index2
+end
+
+tbl17.dl = function()
+local dl = tbl17.cache.dl
+
+if not dl then
+local dl2 = { c = fn35() }
+tbl17.cache.dl = dl2
+dl = dl2
+end
+
+return dl.c
+end
+end
+do -- dm
+local function fn35()
+local v115 = tbl17.dl()
+local v116 = tbl17.a()
+local useItemRemote = tbl17.aS().UseItemRemote
+local clientItem = tbl17.aS().ClientItem
+local v117 = tbl17.cK()
+local v118 = tbl17.ad()
+local v119 = tbl17.b2()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function()
+return setmetatable({ _errorReporter = v118.new(), _inputBindings = {} }, index2)
+end
+
+index2.Reserve = function(arg)
+local new = nil
+
+local function fn36(arg2)
+if arg2 then
+arg._errorReporter:ReportResult(arg:_Load())
+end
+end
+
+local function fn37()
+for k, v120 in arg._inputBindings, nil, nil do
+if v120 == new then
+table.remove(arg._inputBindings, k)
+break
+end
+end
+end
+
+new = v115.new
+new = new(fn36, fn37)
+table.insert(arg._inputBindings, new)
+return new
+end
+
+index2._Dispatch = function(arg, arg2)
+for _, v120 in arg._inputBindings, nil, nil do
+if not v120.Enabled then
+continue
+else
+local handler = v120.Handler
+
+if handler == nil then
+continue
+else
+handler(arg2)
+if not arg2.Block then
+continue
+end
+end
+end
+
+break
+end
+end
+
+index2._Load = function(arg)
+if arg._restore ~= nil then
+return v116.VoidOk
+end
+local input = v102(clientItem, "Input")
+if input == nil then
+return v116.err("InputHook", "function_lookup", "Failed to find Input in prototype")
+end
+
+for _, v120 in debug.getupvalues(input) do
+if type(v120) ~= "table" then
+continue
+end
+
+for k, v121 in v120, nil, nil do
+if typeof(v121) ~= "Instance" or not v119(v121, game:GetService("ReplicatedStorage")) then
+continue
+end
+
+v120[k] = {
+Remotes = {
+Replication = {
+Fighter = {
+UseItem = { FireServer = function(arg2, arg3, arg4, arg5, ...)
+local tbl18 = { Block = false, ObjectId = arg3, Type = v117.decode(arg4), Args = arg5 }
+arg:_Dispatch(tbl18)
+if tbl18.Block then
+return
+end
+local v122 = fireServer
+local args = tbl18.Args
+local v123 = table.pack(...)
+local v124 = useItemRemote
+v123.n = 5 + v123.n - 1
+table.move(v123, 1, v123.n, 5, v123)
+v123[1] = v124
+v123[2] = arg3
+v123[3] = arg4
+v123[4] = args
+v122(table.unpack(v123, 1, v123.n))
+end },
+},
+},
+},
+}
+
+arg._restore = { Tbl = v120, Index = k, Original = v121 }
+return v116.VoidOk
+end
+end
+
+return v116.err("InputHook", "upvalue_scan", "Failed to find ReplicatedStorage upvalue")
+end
+
+index2._Revert = function(arg)
+local restore = arg._restore
+if restore == nil then
+return
+end
+arg._restore = nil
+restore.Tbl[restore.Index] = restore.Original
+end
+
+index2.Destroy = function(arg)
+arg:_Revert()
+arg._errorReporter:Destroy()
+end
+
+return index2
+end
+
+tbl17.dm = function()
+local dm = tbl17.cache.dm
+
+if not dm then
+dm = { c = fn35() }
+tbl17.cache.dm = dm
+end
+
+return dm.c
+end
+end
+do -- gd
+local function fn35()
+local v115 = tbl17.cN()
+local v116 = tbl17.bG()
+tbl17.cF()
+tbl17.dm()
+tbl17.cX()
+local v117 = tbl17.k()
+local index2 = {}
+index2.__index = index2
+
+index2.new = function(arg, arg2, arg3)
+local extendMeleeRange = v117.new("extend_melee_range")
+local tbl18 = { _trove = extendMeleeRange, _playerContext = arg, _fighters = arg2, _inputBinding = arg3 }
+setmetatable(tbl18, index2)
+
+arg3:SetHandler(function(arg4)
+tbl18:_HandleInput(arg4)
+end)
+
+local function fn36()
+arg3:SetEnabled(true)
+end
+
+extendMeleeRange:Connect(v116:GetPropertyChangedSignal({ "ItemModifiers", "ExtendMeleeRange", v86[44] }), fn36)
+fn36()
+return tbl18
+end
+
+index2._HandleInput = function(arg, arg2)
+if arg2.Type ~= "StartShooting" and arg2.Type ~= "StartAiming" then
+return
+end
+local inner = arg._playerContext.Inner
+if inner == nil then
+return
+end
+local v118 = inner.ItemBehaviors:FindByObjectId(arg2.ObjectId)
+if v118 == nil or v118.__type ~= "Melee" then
+return
+end
+local v119 = arg2.Args["\1"]
+if type(v119) ~= "table" then
+return
+end
+local v120 = v115.decode(v119["\0"])
+if v120 == nil then
+return
+end
+local v121 = arg:_FindClosestEnemy(v120.Position, 20)
+if v121 == nil then
+return
+end
+local v122 = v115.encode(CFrame.new(v121.Position) * CFrame.fromOrientation(-1.5707963267948966, 0, 0))
+v119["\0"] = v122
+v119["\1"] = v122
+end
+
+index2._FindClosestEnemy = function(arg, arg2, arg3)
+local huge = math.huge
+local v118 = nil
+
+for _, v119 in arg._fighters.EnemyByPlayer, nil, nil do
+local state = v119.Character.State
+
+if state.Alive then
+local rootPart = state.RootPart
+local magnitude = (rootPart.Position - arg2).Magnitude
+
+if magnitude < arg3 and magnitude < huge then
+huge = magnitude
+v118 = rootPart
+end
+end
+end
+
+return v118
+end
+
+index2.Destroy = function(arg)
+arg._trove:Destroy()
+arg._inputBinding:Destroy()
+end
+
+return index2
+end
+
+tbl17.gd = function()
+local gd = tbl17.cache.gd
+
+if not gd then
+gd = { c = fn35() }
+tbl17.cache.gd = gd
+end
+
+return gd.c
+end
+end
+
+--==========================================================================
+--  Stubs for the modules that were left out
+--==========================================================================
+for _, name in ipairs({ "aL", "aM", "aN", "aO", "aP", "aQ" }) do
+    tbl17[name] = function() return nil end
+end
+
+--  Fixed settings (replaces the config manager / GUI): both always on.
+tbl17.bG = function()
+    return {
+        Data = { ItemModifiers = { AlwaysBackstab = true, ExtendMeleeRange = { Enabled = true, Range = 20 } } },
+        GetPropertyChangedSignal = function() return Signal.new() end,
+    }
+end
+
+tbl17.b().use({ Report = function(_, e)
+    local detail = type(e) == "table" and (e.Detail or e.Operation) or e
+    warn("[stripped] " .. tostring(detail))
+end })
+
+--==========================================================================
+--  Execution notification (image asset)
+--==========================================================================
+task.spawn(function()
+    local ok, gui = pcall(function()
+        local g = Instance.new("ScreenGui")
+        g.Name = "ExecNotify"
+        g.ResetOnSpawn = false
+        g.IgnoreGuiInset = true
+        g.DisplayOrder = 999
+        g.Parent = K.hudParent()
+        return g
+    end)
+    if not ok or not gui then return end
+    local img = Instance.new("ImageLabel")
+    img.BackgroundTransparency = 1
+    img.Image = "rbxassetid://100215200060494"
+    img.ScaleType = Enum.ScaleType.Fit
+    img.AnchorPoint = Vector2.new(0.5, 0)
+    img.Size = UDim2.fromOffset(320, 160)
+    img.Position = UDim2.new(0.5, 0, 0, -170)
+    img.ImageTransparency = 0
+    img.Parent = gui
+    local TweenService = game:GetService("TweenService")
+    TweenService:Create(img, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Position = UDim2.new(0.5, 0, 0, 20) }):Play()
+    task.wait(4)
+    local t = TweenService:Create(img, TweenInfo.new(0.4), { ImageTransparency = 1, Position = UDim2.new(0.5, 0, 0, -170) })
+    t:Play()
+    t.Completed:Wait()
+    gui:Destroy()
+end)
+
+--==========================================================================
+--  Boot: always backstab + melee range 20, no GUI
+--==========================================================================
+task.spawn(function()
+    local lp = Players.LocalPlayer
+    local t0 = os.clock()
+    while not lp and os.clock() - t0 < 60 do task.wait(); lp = Players.LocalPlayer end
+    if not lp then warn("[stripped] no LocalPlayer"); return end
+    local ps = lp:WaitForChild("PlayerScripts", 60)
+    if not ps or not ps:WaitForChild("Controllers", 60) then
+        warn("[stripped] PlayerScripts.Controllers not found (script is built for Rivals)")
+        return
+    end
+    local t1 = os.clock()
+    while os.clock() - t1 < 45 do
+        local ch, pg = lp.Character, lp:FindFirstChild("PlayerGui")
+        local huds = 0
+        if pg then
+            for _, c in ipairs(pg:GetChildren()) do
+                if c:IsA("ScreenGui") then huds += 1 end
+            end
+        end
+        if ch and ch:FindFirstChildOfClass("Humanoid") and huds >= 2 then break end
+        task.wait(1)
+    end
+    if K.destroyed then return end
+
+    local fighters = tbl17.cF().new()
+    local context = tbl17.cX().new(fighters)
+    local inputs = tbl17.dm().new()
+    local backstab = tbl17.di().new(context, fighters)
+    local melee = tbl17.gd().new(context, fighters, inputs:Reserve())
+
+    local hb = _RunService.Heartbeat:Connect(function(dt)
+        context:HeartbeatUpdate()
+        fighters:Update(dt)
+        backstab:Update()
+        context:FlushViewAngles()
+    end)
+
+    K.Unload = function()
+        K.destroyed = true
+        pcall(function() hb:Disconnect() end)
+        pcall(function() backstab:Destroy() end)
+        pcall(function() melee:Destroy() end)
+        pcall(function() inputs:Destroy() end)
+        pcall(function() context:Destroy() end)
+        pcall(function() fighters:Destroy() end)
+        for _, f in ipairs(K.cleanups) do pcall(f) end
+    end
+    print("[stripped] always backstab + melee range 20 active")
+end)
