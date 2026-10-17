@@ -1,0 +1,380 @@
+-- AirSlide_BaseUnderMe_BiggerLeadingBase LocalScript
+-- Place in StarterPlayer > StarterPlayerScripts
+-- Delete/disable AirSlide and AirSlideMobile first.
+--
+-- Hold your game's slide button while in the air: you slide forward in the
+-- direction you're facing, at a steady height, with the same slide animation
+-- and sound as the ground slide.
+--
+-- Slide once on the ground first so the script can learn your slide animation.
+--
+-- NEW: while you air slide, a base appears under your feet and moves with you,
+-- so it feels like sliding on the ground. It only exists during an air slide.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local KEYWORD = "slide"
+
+-- Air slide settings
+local SLIDE_SPEED = 55          -- forward speed (studs/sec)
+local AIR_SLIDE_MAX_TIME = 1.5  -- seconds you can hold height; 0 = unlimited
+local SINK_SPEED = 0            -- downward speed while sliding (0 = stay level)
+local TURN_RESPONSE = 8         -- how fast the slide direction follows your input
+
+-- Small height progression while sliding
+local RISE_ACCEL = 4            -- upward speed gained per second of sliding
+local MAX_RISE_SPEED = 8        -- cap on upward speed
+local MAX_HEIGHT_GAIN = 12      -- max studs gained in one air slide
+
+-- Start boost + camera angle
+local START_BOOST = 16          -- upward kick when the slide starts
+local BOOST_DECAY = 35          -- how fast the kick fades (higher = shorter)
+local PITCH_SPEED = 25          -- vertical speed at a full look up/down
+local boost = 0
+
+-- Base under you while air sliding
+local BASE_SIZE = Vector3.new(20, 1, 20)
+local BASE_TRANSPARENCY = 1            -- 1 = invisible, 0 = solid
+local BASE_COLOR = Color3.fromRGB(120, 200, 255)
+local BASE_LEAD_TIME = 0.12           -- base runs ahead of you by this many seconds of travel
+local LAND_DISTANCE = 2                -- real ground this close under your feet ends the slide
+
+local slideDir = nil
+local startY = 0
+
+local SLIDE_SOUND_ID = "rbxassetid://16737738420"
+local LEARN_WINDOW = 0.4
+
+local held = false
+local airTime = 0
+local expired = false
+local hooked = {}
+
+local learnedAnim = nil
+local lastGroundPress = -math.huge
+local ourTracks = setmetatable({}, { __mode = "k" })
+local fxTrack = nil
+local fxSound = nil
+
+local function getCharacter()
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return hum, root
+	end
+end
+
+local function isAirborne(hum)
+	return hum.FloorMaterial == Enum.Material.Air
+end
+
+---------------------------------------------------------------------
+-- Learn the ground slide animation
+---------------------------------------------------------------------
+local function hookAnimator(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	local animator = hum:WaitForChild("Animator", 10)
+	if not animator then return end
+
+	animator.AnimationPlayed:Connect(function(track)
+		if ourTracks[track] then return end
+		if os.clock() - lastGroundPress > LEARN_WINDOW then return end
+		local anim = track.Animation
+		if anim and anim.AnimationId ~= "" then
+			learnedAnim = {
+				id = anim.AnimationId,
+				priority = track.Priority,
+				looped = track.Looped,
+			}
+			print("[AirSlideAuto] Learned slide animation:", anim.AnimationId)
+		end
+	end)
+end
+
+if player.Character then task.spawn(hookAnimator, player.Character) end
+player.CharacterAdded:Connect(hookAnimator)
+
+-- Fallback: any Animation named "slide" until a ground slide is learned
+task.spawn(function()
+	for _, d in ipairs(game:GetDescendants()) do
+		if not learnedAnim and d:IsA("Animation") and d.AnimationId ~= ""
+			and d.Name:lower():find(KEYWORD) then
+			learnedAnim = {
+				id = d.AnimationId,
+				priority = Enum.AnimationPriority.Action,
+				looped = true,
+			}
+		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- Animation + sound while air sliding
+---------------------------------------------------------------------
+local function startFX(hum, root)
+	if learnedAnim and not fxTrack then
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			local anim = Instance.new("Animation")
+			anim.AnimationId = learnedAnim.id
+			local track = animator:LoadAnimation(anim)
+			ourTracks[track] = true
+			track.Priority = learnedAnim.priority
+			track.Looped = learnedAnim.looped
+			track:Play(0.1)
+			fxTrack = track
+		end
+	end
+
+	if not fxSound then
+		local s = Instance.new("Sound")
+		s.SoundId = SLIDE_SOUND_ID
+		s.Looped = true
+		s.Volume = 1
+		s.Parent = root
+		s:Play()
+		fxSound = s
+	end
+end
+
+local function stopFX()
+	if fxTrack then
+		fxTrack:Stop(0.1)
+		fxTrack = nil
+	end
+	if fxSound then
+		fxSound:Stop()
+		fxSound:Destroy()
+		fxSound = nil
+	end
+end
+
+---------------------------------------------------------------------
+-- Button hooking
+---------------------------------------------------------------------
+local function isPress(input)
+	return input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseButton1
+end
+
+local function hook(button)
+	if hooked[button] then return end
+	hooked[button] = true
+
+	button.InputBegan:Connect(function(input)
+		if not isPress(input) then return end
+		held = true
+		local hum = getCharacter()
+		if hum and not isAirborne(hum) then
+			lastGroundPress = os.clock()
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if isPress(input) then
+			held = false
+			airTime = 0
+			expired = false
+		end
+	end)
+	print("[AirSlideAuto] Hooked slide button:", button:GetFullName())
+end
+
+local function matches(inst)
+	if not inst:IsA("GuiButton") then return false end
+	if inst.Name:lower():find(KEYWORD) then return true end
+	if inst:IsA("TextButton") and inst.Text:lower():find(KEYWORD) then return true end
+	return false
+end
+
+for _, d in ipairs(playerGui:GetDescendants()) do
+	if matches(d) then hook(d) end
+end
+playerGui.DescendantAdded:Connect(function(d)
+	if matches(d) then hook(d) end
+end)
+
+task.spawn(function()
+	while true do
+		for name in pairs(ContextActionService:GetAllBoundActionInfo()) do
+			if name:lower():find(KEYWORD) then
+				local btn = ContextActionService:GetButton(name)
+				if btn then hook(btn) end
+			end
+		end
+		task.wait(2)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Base under you
+---------------------------------------------------------------------
+local base = nil
+local slideLV = nil
+local slideAtt = nil
+local baseActive = false
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function createBase(root)
+	if base then return end
+
+	base = Instance.new("Part")
+	base.Name = "AirSlideBase"
+	base.Size = BASE_SIZE
+	base.Anchored = true
+	base.CanCollide = true
+	base.CanTouch = false
+	base.CanQuery = false
+	base.CastShadow = false
+	base.Material = Enum.Material.SmoothPlastic
+	base.Color = BASE_COLOR
+	base.Transparency = BASE_TRANSPARENCY
+	base.Parent = workspace
+
+	-- Holds your slide velocity even while you stand on the base
+	slideAtt = Instance.new("Attachment")
+	slideAtt.Name = "AirSlideAttachment"
+	slideAtt.Parent = root
+
+	slideLV = Instance.new("LinearVelocity")
+	slideLV.Name = "AirSlideVelocity"
+	slideLV.Attachment0 = slideAtt
+	slideLV.RelativeTo = Enum.ActuatorRelativeTo.World
+	slideLV.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	slideLV.MaxForce = math.huge
+	slideLV.VectorVelocity = root.AssemblyLinearVelocity
+	slideLV.Parent = root
+
+	baseActive = true
+end
+
+local function destroyBase()
+	if base then base:Destroy() base = nil end
+	if slideLV then slideLV:Destroy() slideLV = nil end
+	if slideAtt then slideAtt:Destroy() slideAtt = nil end
+	baseActive = false
+end
+
+-- Keeps the base under your feet (placed where you'll be next frame)
+local function updateBase(hum, root, vel, dt)
+	if not base then return end
+	local next = root.Position + vel * dt
+
+	-- Lead the base ahead of you in your sliding direction (never past a safe limit)
+	local lead = Vector3.new(vel.X, 0, vel.Z) * BASE_LEAD_TIME
+	local maxLead = BASE_SIZE.X / 2 - 2
+	if lead.Magnitude > maxLead then
+		lead = lead.Unit * maxLead
+	end
+
+	local feetY = next.Y - (root.Size.Y / 2 + hum.HipHeight)
+	base.CFrame = CFrame.new(next.X + lead.X, feetY - BASE_SIZE.Y / 2, next.Z + lead.Z)
+end
+
+-- Is there REAL ground (not our base) right under you?
+local function realGroundClose(hum, root)
+	rayParams.FilterDescendantsInstances = { player.Character, base }
+	local feetOffset = root.Size.Y / 2 + hum.HipHeight
+	local hit = workspace:Raycast(root.Position, Vector3.new(0, -(feetOffset + LAND_DISTANCE), 0), rayParams)
+	return hit ~= nil
+end
+
+---------------------------------------------------------------------
+-- Main loop
+---------------------------------------------------------------------
+RunService.Heartbeat:Connect(function(dt)
+	local hum, root = getCharacter()
+	if not hum then
+		destroyBase()
+		stopFX()
+		return
+	end
+
+	-- On real ground: your game's own slide handles everything
+	local grounded
+	if baseActive then
+		grounded = realGroundClose(hum, root)  -- we're standing on our own base
+	else
+		grounded = not isAirborne(hum)
+	end
+	if grounded then
+		airTime = 0
+		expired = false
+		destroyBase()
+		stopFX()
+		return
+	end
+
+	if not held or expired then
+		destroyBase()
+		stopFX()
+		return
+	end
+
+	if airTime == 0 then
+		startY = root.Position.Y
+		slideDir = nil
+		boost = START_BOOST
+		createBase(root)
+	end
+
+	airTime += dt
+	if AIR_SLIDE_MAX_TIME > 0 and airTime > AIR_SLIDE_MAX_TIME then
+		expired = true
+		destroyBase()
+		stopFX()
+		return
+	end
+
+	-- Direction: your movement input if you're pushing one,
+	-- otherwise where the camera is facing
+	local cam = workspace.CurrentCamera
+	local look = cam and cam.CFrame.LookVector or root.CFrame.LookVector
+	local pitch = look.Y -- -1 = looking straight down, 1 = straight up
+
+	local desired = hum.MoveDirection
+	if desired.Magnitude < 0.1 then
+		desired = Vector3.new(look.X, 0, look.Z)
+	end
+	if desired.Magnitude < 0.01 then return end
+	desired = desired.Unit
+
+	if not slideDir then
+		slideDir = desired
+	else
+		local blended = slideDir:Lerp(desired, math.clamp(TURN_RESPONSE * dt, 0, 1))
+		if blended.Magnitude > 0.01 then slideDir = blended.Unit end
+	end
+
+	-- Small progressive height gain the longer you slide
+	local rise = 0
+	if root.Position.Y - startY < MAX_HEIGHT_GAIN then
+		rise = math.min(airTime * RISE_ACCEL, MAX_RISE_SPEED)
+	end
+
+	-- Launch kick that fades out
+	boost = math.max(0, boost - BOOST_DECAY * dt)
+
+	-- Camera angle: look down = go down, look up = go higher
+	local pitchVel = pitch * PITCH_SPEED
+
+	local vel = Vector3.new(
+		slideDir.X * SLIDE_SPEED,
+		rise + boost + pitchVel - SINK_SPEED,
+		slideDir.Z * SLIDE_SPEED
+	)
+	if slideLV then slideLV.VectorVelocity = vel end
+	root.AssemblyLinearVelocity = vel
+	updateBase(hum, root, vel, dt)
+
+	startFX(hum, root)
+end)
