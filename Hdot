@@ -1,0 +1,462 @@
+-- GroundSlideInfinite LocalScript  (separate from AirSlideAuto)
+-- Place in StarterPlayer > StarterPlayerScripts
+--
+-- Hooks your game's slide button. While sliding you stay glued to the
+-- ground (follows slopes, can't launch you upward). Release and press again
+-- and you keep your momentum, so you can chain slides forever.
+-- Direction = your movement input, or the camera's facing if no input.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local KEYWORD = "slide"
+
+-- Slide feel
+local SLIDE_SPEED = 60        -- top slide speed (studs/sec)
+local START_SPEED = 30        -- speed you start a slide with
+local ACCEL = 4               -- how fast you reach top speed while held
+local COAST_DECAY = 1.5       -- how fast you slow after releasing (higher = quicker stop)
+local COAST_MIN = 6           -- below this speed the slide fully ends
+local TURN_RESPONSE = 8       -- steering sharpness
+
+-- Ground sticking
+local SNAP_RANGE = 6          -- how far below your feet counts as "ground"
+local SNAP_STIFFNESS = 25     -- how hard you're pulled to the ground
+local MAX_SNAP_SPEED = 60     -- cap on that pull
+local JUMP_GRACE = 0.4        -- seconds the ground snap turns off after a jump
+
+-- Effects (turn off if your game's own slide already plays them and it doubles up)
+local PLAY_ANIMATION = true
+local PLAY_SOUND = true
+local SLIDE_SOUND_ID = "rbxassetid://16737738420"
+local LEARN_WINDOW = 0.4
+
+local held = false
+local glueEnabled = true   -- toggled by the on-screen button
+local posLocked = false    -- set by the control bar: stops the circle from moving
+local buttonHidden = false -- set by the control bar: circle is invisible but still works
+local speed = 0
+local slideDir = nil
+local jumpUntil = 0
+local hooked = {}
+
+local learnedAnim = nil
+local lastPress = -math.huge
+local ourTracks = setmetatable({}, { __mode = "k" })
+local fxTrack = nil
+local fxSound = nil
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getCharacter()
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return hum, root, char
+	end
+end
+
+---------------------------------------------------------------------
+-- Learn the game's slide animation (slide once normally first)
+---------------------------------------------------------------------
+local function hookCharacter(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+
+	hum.StateChanged:Connect(function(_, new)
+		if new == Enum.HumanoidStateType.Jumping then
+			jumpUntil = os.clock() + JUMP_GRACE
+		end
+	end)
+
+	local animator = hum:WaitForChild("Animator", 10)
+	if not animator then return end
+	animator.AnimationPlayed:Connect(function(track)
+		if ourTracks[track] then return end
+		if os.clock() - lastPress > LEARN_WINDOW then return end
+		local anim = track.Animation
+		if anim and anim.AnimationId ~= "" then
+			learnedAnim = {
+				id = anim.AnimationId,
+				priority = track.Priority,
+				looped = track.Looped,
+			}
+			print("[GroundSlide] Learned slide animation:", anim.AnimationId)
+		end
+	end)
+end
+
+if player.Character then task.spawn(hookCharacter, player.Character) end
+player.CharacterAdded:Connect(hookCharacter)
+
+task.spawn(function()
+	for _, d in ipairs(game:GetDescendants()) do
+		if not learnedAnim and d:IsA("Animation") and d.AnimationId ~= ""
+			and d.Name:lower():find(KEYWORD) then
+			learnedAnim = {
+				id = d.AnimationId,
+				priority = Enum.AnimationPriority.Action,
+				looped = true,
+			}
+		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- Effects
+---------------------------------------------------------------------
+local function startFX(hum, root)
+	if PLAY_ANIMATION and learnedAnim and not fxTrack then
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			local anim = Instance.new("Animation")
+			anim.AnimationId = learnedAnim.id
+			local track = animator:LoadAnimation(anim)
+			ourTracks[track] = true
+			track.Priority = learnedAnim.priority
+			track.Looped = learnedAnim.looped
+			track:Play(0.1)
+			fxTrack = track
+		end
+	end
+	if PLAY_SOUND and not fxSound then
+		local s = Instance.new("Sound")
+		s.SoundId = SLIDE_SOUND_ID
+		s.Looped = true
+		s.Volume = 1
+		s.Parent = root
+		s:Play()
+		fxSound = s
+	end
+end
+
+local function stopFX()
+	if fxTrack then
+		fxTrack:Stop(0.1)
+		fxTrack = nil
+	end
+	if fxSound then
+		fxSound:Stop()
+		fxSound:Destroy()
+		fxSound = nil
+	end
+end
+
+---------------------------------------------------------------------
+-- Button hooking
+---------------------------------------------------------------------
+local function isPress(input)
+	return input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseButton1
+end
+
+local function hook(button)
+	if hooked[button] then return end
+	hooked[button] = true
+	button.InputBegan:Connect(function(input)
+		if isPress(input) then
+			held = true
+			lastPress = os.clock()
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if isPress(input) then held = false end
+	end)
+	print("[GroundSlide] Hooked slide button:", button:GetFullName())
+end
+
+local function matches(inst)
+	if not inst:IsA("GuiButton") then return false end
+	if inst.Name:lower():find(KEYWORD) then return true end
+	if inst:IsA("TextButton") and inst.Text:lower():find(KEYWORD) then return true end
+	return false
+end
+
+for _, d in ipairs(playerGui:GetDescendants()) do
+	if matches(d) then hook(d) end
+end
+playerGui.DescendantAdded:Connect(function(d)
+	if matches(d) then hook(d) end
+end)
+
+task.spawn(function()
+	while true do
+		for name in pairs(ContextActionService:GetAllBoundActionInfo()) do
+			if name:lower():find(KEYWORD) then
+				local btn = ContextActionService:GetButton(name)
+				if btn then hook(btn) end
+			end
+		end
+		task.wait(2)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Glue ON/OFF button (tap to toggle, drag to move)
+---------------------------------------------------------------------
+local TAP_DRAG_THRESHOLD = 8  -- pixels you must move before it counts as a drag
+
+local toggleGui = Instance.new("ScreenGui")
+toggleGui.Name = "GlueToggleGui"
+toggleGui.ResetOnSpawn = false
+toggleGui.IgnoreGuiInset = true
+toggleGui.DisplayOrder = 100
+toggleGui.Parent = playerGui
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Name = "GlueToggle"
+toggleBtn.Size = UDim2.fromOffset(56, 56)
+toggleBtn.Position = UDim2.fromOffset(20, 200)
+toggleBtn.AutoButtonColor = false
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 12
+toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleBtn.Parent = toggleGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(1, 0)
+corner.Parent = toggleBtn
+
+local function refreshToggle()
+	if glueEnabled then
+		toggleBtn.Text = "GLUE\nON"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+	else
+		toggleBtn.Text = "GLUE\nOFF"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(190, 55, 55)
+	end
+end
+refreshToggle()
+
+local dragging = false
+local moved = false
+local dragStart = Vector3.zero
+local startPos = Vector2.zero
+
+toggleBtn.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1
+		and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+	dragging = true
+	moved = false
+	dragStart = input.Position
+	startPos = toggleBtn.AbsolutePosition
+
+	input.Changed:Connect(function()
+		if input.UserInputState == Enum.UserInputState.End then
+			dragging = false
+			if not moved then
+				glueEnabled = not glueEnabled
+				refreshToggle()
+			end
+		end
+	end)
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+
+	local delta = input.Position - dragStart
+	if not moved and Vector2.new(delta.X, delta.Y).Magnitude > TAP_DRAG_THRESHOLD then
+		moved = true
+	end
+	if moved and not posLocked then
+		local cam = workspace.CurrentCamera
+		local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+		local size = toggleBtn.AbsoluteSize
+		local x = math.clamp(startPos.X + delta.X, 0, view.X - size.X)
+		local y = math.clamp(startPos.Y + delta.Y, 0, view.Y - size.Y)
+		toggleBtn.Position = UDim2.fromOffset(x, y)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Control bar (drag it by the handle): HIDE/SHOW and LOCK/UNLOCK the circle
+---------------------------------------------------------------------
+local bar = Instance.new("Frame")
+bar.Name = "GlueControlBar"
+bar.Size = UDim2.fromOffset(152, 40)
+bar.Position = UDim2.fromOffset(20, 266)
+bar.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+bar.BackgroundTransparency = 0.15
+bar.BorderSizePixel = 0
+bar.Parent = toggleGui
+
+local barCorner = Instance.new("UICorner")
+barCorner.CornerRadius = UDim.new(0, 12)
+barCorner.Parent = bar
+
+local function makeBarButton(text, x, width)
+	local b = Instance.new("TextButton")
+	b.Text = text
+	b.Position = UDim2.fromOffset(x, 4)
+	b.Size = UDim2.fromOffset(width, 32)
+	b.AutoButtonColor = false
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.BackgroundColor3 = Color3.fromRGB(60, 60, 72)
+	b.Parent = bar
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 9)
+	c.Parent = b
+	return b
+end
+
+local handle = makeBarButton("=", 4, 24)
+local hideBtn = makeBarButton("HIDE", 32, 56)
+local lockBtn = makeBarButton("LOCK", 92, 56)
+
+-- HIDE/SHOW: invisible, but the circle keeps working and can still be tapped
+local function applyVisibility()
+	local t = buttonHidden and 1 or 0
+	toggleBtn.BackgroundTransparency = t
+	toggleBtn.TextTransparency = t
+	hideBtn.Text = buttonHidden and "SHOW" or "HIDE"
+	hideBtn.BackgroundColor3 = buttonHidden and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(60, 60, 72)
+end
+
+-- LOCK/UNLOCK: freezes the circle's position
+local function applyLock()
+	lockBtn.Text = posLocked and "UNLOCK" or "LOCK"
+	lockBtn.BackgroundColor3 = posLocked and Color3.fromRGB(200, 130, 30) or Color3.fromRGB(60, 60, 72)
+end
+
+hideBtn.Activated:Connect(function()
+	buttonHidden = not buttonHidden
+	applyVisibility()
+end)
+
+lockBtn.Activated:Connect(function()
+	posLocked = not posLocked
+	applyLock()
+end)
+
+applyVisibility()
+applyLock()
+
+-- Drag the bar by its handle
+local barDragging = false
+local barDragStart = Vector3.zero
+local barStartPos = Vector2.zero
+
+handle.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1
+		and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+	barDragging = true
+	barDragStart = input.Position
+	barStartPos = bar.AbsolutePosition
+	input.Changed:Connect(function()
+		if input.UserInputState == Enum.UserInputState.End then
+			barDragging = false
+		end
+	end)
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not barDragging then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+	local delta = input.Position - barDragStart
+	local cam = workspace.CurrentCamera
+	local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	local size = bar.AbsoluteSize
+	local x = math.clamp(barStartPos.X + delta.X, 0, view.X - size.X)
+	local y = math.clamp(barStartPos.Y + delta.Y, 0, view.Y - size.Y)
+	bar.Position = UDim2.fromOffset(x, y)
+end)
+
+---------------------------------------------------------------------
+-- Main loop
+---------------------------------------------------------------------
+RunService.Heartbeat:Connect(function(dt)
+	local hum, root, char = getCharacter()
+	if not hum then
+		speed = 0
+		stopFX()
+		return
+	end
+
+	-- Toggle OFF: this script does nothing, your game's normal slide runs untouched
+	if not glueEnabled then
+		speed = 0
+		stopFX()
+		return
+	end
+
+	-- Find the ground under the character
+	rayParams.FilterDescendantsInstances = { char }
+	local reach = root.Size.Y / 2 + hum.HipHeight + SNAP_RANGE
+	local hit = workspace:Raycast(root.Position, Vector3.new(0, -reach, 0), rayParams)
+	local jumping = os.clock() < jumpUntil
+
+	-- A slide can only START on the ground
+	if held and speed < START_SPEED and hit and not jumping then
+		speed = START_SPEED
+	end
+
+	-- Speed up while held, coast down after release
+	if held then
+		if speed > 0 then
+			speed += (SLIDE_SPEED - speed) * math.min(ACCEL * dt, 1)
+		end
+	else
+		speed *= (1 - math.min(COAST_DECAY * dt, 1))
+		if speed < COAST_MIN then speed = 0 end
+	end
+
+	if speed <= 0 then
+		stopFX()
+		return
+	end
+
+	-- Direction: movement input, else camera facing (flat)
+	local desired = hum.MoveDirection
+	if desired.Magnitude < 0.1 then
+		local cam = workspace.CurrentCamera
+		local look = cam and cam.CFrame.LookVector or root.CFrame.LookVector
+		desired = Vector3.new(look.X, 0, look.Z)
+	end
+	if desired.Magnitude > 0.01 then
+		desired = desired.Unit
+		if not slideDir then
+			slideDir = desired
+		else
+			local blended = slideDir:Lerp(desired, math.clamp(TURN_RESPONSE * dt, 0, 1))
+			if blended.Magnitude > 0.01 then slideDir = blended.Unit end
+		end
+	end
+	if not slideDir then return end
+
+	-- Stick to the ground (follows slopes, no launching upward)
+	local vy = root.AssemblyLinearVelocity.Y
+	if hit and not jumping and glueEnabled then
+		local targetY = hit.Position.Y + hum.HipHeight + root.Size.Y / 2
+		vy = math.clamp((targetY - root.Position.Y) * SNAP_STIFFNESS, -MAX_SNAP_SPEED, MAX_SNAP_SPEED)
+	end
+
+	root.AssemblyLinearVelocity = Vector3.new(slideDir.X * speed, vy, slideDir.Z * speed)
+
+	if held and hit then
+		startFX(hum, root)
+	else
+		stopFX()
+	end
+end)
